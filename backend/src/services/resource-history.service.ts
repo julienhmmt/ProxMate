@@ -1,5 +1,7 @@
 import { prisma } from '../lib/prisma.js';
 import * as pve from './proxmox.service.js';
+import { envNumber } from '../lib/env-number.js';
+import { tagsMarkRow } from './vm.service.js';
 
 /**
  * Per-tenant resource history. A scheduler tick samples every running VM's live
@@ -7,7 +9,7 @@ import * as pve from './proxmox.service.js';
  * owner over a window ("who consumed what last week"). Complements the live-only
  * Admin Monitor. Samples are denormalized + pruned to a rolling retention window.
  */
-const RETENTION_DAYS = Math.max(1, Number(process.env['RESOURCE_HISTORY_DAYS'] ?? 14));
+const RETENTION_DAYS = envNumber('RESOURCE_HISTORY_DAYS', 14, 1);
 const DAY_MS = 86_400_000;
 
 interface PveResource {
@@ -17,6 +19,7 @@ interface PveResource {
   cpu?: number;
   mem?: number;
   maxmem?: number;
+  tags?: string;
 }
 
 /** Take one usage sample for every running VM ProxMate manages. Best-effort. */
@@ -33,7 +36,11 @@ export async function sampleResourceUsage(): Promise<{ sampled: number }> {
 
   const rows = vms
     .map((vm) => ({ vm, live: byVmid.get(vm.proxmoxVmId) }))
-    .filter((x): x is { vm: typeof x.vm; live: PveResource } => x.live?.status === 'running')
+    // Only a guest carrying the row's own ProxMate tag is that machine's usage.
+    .filter(
+      (x): x is { vm: typeof x.vm; live: PveResource } =>
+        x.live?.status === 'running' && tagsMarkRow(x.live.tags, x.vm.id),
+    )
     .map(({ vm, live }) => ({
       userId: vm.userId,
       vmId: vm.id,

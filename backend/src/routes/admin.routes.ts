@@ -2,7 +2,7 @@ import { Router, type Request, type Response } from 'express';
 import { z } from 'zod';
 import { promises as fsp } from 'node:fs';
 import path from 'node:path';
-import { requireAuth } from '../middleware/auth.js';
+import { requireAuth, requireSession } from '../middleware/auth.js';
 import { requireAdmin } from '../middleware/admin.js';
 import { enforceMfaSetup } from '../middleware/mfa.js';
 import { assertPublicHttpUrlShape } from '../lib/url-safety.js';
@@ -19,6 +19,7 @@ import {
   getDefaultNode,
   listPciMappings,
   pveMessage,
+  NETWORK_NAME_RE,
 } from '../services/proxmox.service.js';
 import { listAudit, recordAudit } from '../services/audit.service.js';
 import { getUsageByUser } from '../services/resource-history.service.js';
@@ -44,7 +45,7 @@ import {
   detachPassthrough,
   PassthroughRequestError,
 } from '../services/passthrough-request.service.js';
-import { getOwnedVm } from '../services/vm.service.js';
+import { getOwnedVm, listUnmatchedVms, adoptGuest, AdoptError } from '../services/vm.service.js';
 import {
   checkForUpdate,
   getUpdateStatus,
@@ -56,7 +57,13 @@ import {
 import { getMailConfig, saveMailConfig, verifyMailConfig, isMailConfigured, sendMail } from '../services/mail.service.js';
 import { announcementEmail } from '../lib/email-templates.js';
 import { unsubscribeToken } from '../services/broadcast-optout.service.js';
-import { getNotifyConfig, saveNotifyConfig, sendTestNotification, NOTIFY_EVENTS } from '../services/notify.service.js';
+import {
+  getNotifyConfig,
+  saveNotifyConfig,
+  sendTestNotification,
+  maskWebhookUrl,
+  NOTIFY_EVENTS,
+} from '../services/notify.service.js';
 import * as sso from '../services/sso.service.js';
 import { getIdeConfig, saveIdeConfig, isValidIngressCidr } from '../services/ide.service.js';
 import { probeIdeReachability } from '../services/ide-provision.service.js';
@@ -79,6 +86,9 @@ import { prisma } from '../lib/prisma.js';
 const router = Router();
 
 router.use(requireAuth, requireAdmin, enforceMfaSetup);
+// Routes that decide how accounts sign in (password reset, SSO, kiosk PIN) also
+// carry `requireSession`: an admin's API token automates the cluster, it must
+// not be able to take over other accounts or rewire authentication.
 
 // ─── GET /api/admin/audit ─────────────────────────────────────
 // Append-only activity trail (who did what, when). Newest first, paginated.
@@ -107,6 +117,9 @@ router.get('/settings', async (_req: Request, res: Response) => {
 
   const mail = await getMailConfig();
   const ssoCfg = await sso.getSsoConfig();
+  // The webhook URL carries the receiver's token, so like the other secrets it is
+  // reported only as "is one set" plus a masked form that shows where it points.
+  const { webhookUrl, ...notifyCfg } = await getNotifyConfig();
   res.json({
     proxmox: { host, tokenId, verifySsl: verifySsl === 'true', hasSecret: !!(await getConfig('proxmox_token_secret')) },
     defaults: { storage, bridge, isoStorage, backupStorage },
@@ -115,7 +128,7 @@ router.get('/settings', async (_req: Request, res: Response) => {
     smtp: mail
       ? { configured: true, host: mail.host, port: mail.port, secure: mail.secure, user: mail.user ?? '', from: mail.from, hasPass: !!mail.pass }
       : { configured: false },
-    notify: await getNotifyConfig(),
+    notify: { ...notifyCfg, hasWebhookUrl: !!webhookUrl, webhookUrlMasked: maskWebhookUrl(webhookUrl) },
     sso: ssoCfg
       ? {
           configured: true,
@@ -150,7 +163,7 @@ const KioskSchema = z.object({
   pin: z.string().max(64).refine((v) => v === '' || isValidKioskPin(v), '4–12 digits (or empty to clear)'),
 });
 
-router.put('/settings/kiosk', async (req: Request, res: Response) => {
+router.put('/settings/kiosk', requireSession, async (req: Request, res: Response) => {
   const parsed = KioskSchema.safeParse(req.body);
   if (!parsed.success) {
     res.status(400).json({ error: 'Validation failed', details: parsed.error.flatten() });
@@ -243,6 +256,16 @@ router.put('/settings/smtp', async (req: Request, res: Response) => {
     return;
   }
   await saveMailConfig(parsed.data);
+  // Names the server and account, never the password: the audit log is readable
+  // by every admin and outlives the credential.
+  await recordAudit({
+    action: 'admin.smtp_config',
+    actor: (req as AuthRequest).user,
+    detail: `${parsed.data.host}:${parsed.data.port}${parsed.data.user ? ` as ${parsed.data.user}` : ''}${
+      parsed.data.pass ? ' (password replaced)' : ''
+    }`,
+    req,
+  });
   res.json({ success: true });
 });
 
@@ -257,7 +280,8 @@ router.post('/settings/smtp/test', async (_req: Request, res: Response) => {
 // ─── Event notifications (webhook + email) ────────────────────
 
 const NotifySchema = z.object({
-  webhookUrl: z.string().max(2000).optional(), // blank = webhook disabled
+  webhookUrl: z.string().max(2000).optional(), // blank = keep the stored one
+  clearWebhookUrl: z.boolean().default(false), // remove the webhook (disables it)
   emailEnabled: z.boolean().default(false),
   emailTo: z.string().max(200).optional(), // blank = all admins
   events: z.array(z.enum(NOTIFY_EVENTS)).default([]),
@@ -281,11 +305,20 @@ router.put('/settings/notifications', async (req: Request, res: Response) => {
   }
   await saveNotifyConfig({
     webhookUrl: url,
+    clearWebhookUrl: parsed.data.clearWebhookUrl,
     emailEnabled: parsed.data.emailEnabled,
     emailTo: parsed.data.emailTo,
     events: parsed.data.events,
   });
-  await recordAudit({ action: 'admin.notify_config', actor: (req as AuthRequest).user, req });
+  // What changed, never the URL itself (it carries the receiver's token).
+  const webhook = parsed.data.clearWebhookUrl ? 'removed' : url ? 'replaced' : 'kept';
+  const n = parsed.data.events.length;
+  await recordAudit({
+    action: 'admin.notify_config',
+    actor: (req as AuthRequest).user,
+    detail: `webhook ${webhook}, email ${parsed.data.emailEnabled ? 'on' : 'off'}, ${n} event${n === 1 ? '' : 's'}`,
+    req,
+  });
   res.json({ success: true });
 });
 
@@ -410,7 +443,7 @@ const SsoSchema = z.object({
   buttonLabel: z.string().optional(),
 });
 
-router.put('/settings/sso', async (req: Request, res: Response) => {
+router.put('/settings/sso', requireSession, async (req: Request, res: Response) => {
   const parsed = SsoSchema.safeParse(req.body);
   if (!parsed.success) {
     res.status(400).json({ error: 'Validation failed', details: parsed.error.flatten() });
@@ -435,9 +468,13 @@ router.get('/password-requests', async (_req: Request, res: Response) => {
   res.json(await listResetRequests());
 });
 
-const AdminResetSchema = z.object({ password: z.string().min(8, 'Password must be at least 8 characters') });
+const AdminResetSchema = z.object({
+  password: z.string().min(8, 'Password must be at least 8 characters'),
+  // Also delete the user's passkeys (for an account believed compromised). Off by default.
+  removePasskeys: z.boolean().optional(),
+});
 
-router.post('/users/:id/reset-password', async (req: Request, res: Response) => {
+router.post('/users/:id/reset-password', requireSession, async (req: Request, res: Response) => {
   const parsed = AdminResetSchema.safeParse(req.body);
   if (!parsed.success) {
     res.status(400).json({ error: 'Validation failed', details: parsed.error.flatten() });
@@ -447,10 +484,11 @@ router.post('/users/:id/reset-password', async (req: Request, res: Response) => 
   const target = await prisma.user.findUnique({ where: { id: userId } });
   if (!target) { res.status(404).json({ error: 'User not found' }); return; }
 
-  await adminResetPassword(userId, parsed.data.password);
+  const removePasskeys = parsed.data.removePasskeys ?? false;
+  await adminResetPassword(userId, parsed.data.password, { removePasskeys });
   await recordAudit({
     action: 'admin.reset_password', actor: (req as AuthRequest).user,
-    targetType: 'user', targetId: userId, detail: target.email, req,
+    targetType: 'user', targetId: userId, detail: removePasskeys ? `${target.email} (passkeys removed)` : target.email, req,
   });
   res.json({ success: true });
 });
@@ -476,10 +514,19 @@ router.put('/settings/proxmox', async (req: Request, res: Response) => {
   await setConfig('proxmox_host', host);
   await setConfig('proxmox_token_id', tokenId);
   await setConfig('proxmox_verify_ssl', String(verifySsl));
-  if (tokenSecret && tokenSecret.trim().length > 0) {
+  const secretReplaced = !!tokenSecret && tokenSecret.trim().length > 0;
+  if (secretReplaced) {
     await setConfig('proxmox_token_secret', tokenSecret, true);
   }
 
+  // Repointing ProxMate at another cluster or token is one of the most consequential
+  // changes an admin can make, so it is recorded — without the secret itself.
+  await recordAudit({
+    action: 'admin.proxmox_config',
+    actor: (req as AuthRequest).user,
+    detail: `${host} as ${tokenId}, verifySsl=${verifySsl}${secretReplaced ? ', secret replaced' : ''}`,
+    req,
+  });
   res.json({ success: true });
 });
 
@@ -499,7 +546,9 @@ router.post('/settings/proxmox/test', async (_req: Request, res: Response) => {
 
 const DefaultsSchema = z.object({
   storage: z.string().min(1),
-  bridge: z.string().min(1),
+  // May be typed by hand when discovery can't list it, so it gets the same check the
+  // NIC writer applies rather than failing later on every deploy.
+  bridge: z.string().trim().regex(NETWORK_NAME_RE, "Network names start with a letter and use only letters, digits, '.', '_' or '-' (max 32), e.g. vmbr0 or a VNet ID."),
   isoStorage: z.string().min(1),
   // Empty string = clear the override and let the backend auto-pick.
   backupStorage: z.string().optional(),
@@ -513,8 +562,7 @@ router.put('/settings/defaults', async (req: Request, res: Response) => {
   }
   // Capture the old values first: these decide where every future VM is placed and
   // whether it can ever be migrated, so "what changed, from what, and who did it"
-  // has to be answerable afterwards. This route previously wrote no audit entry at
-  // all — the only admin route that didn't.
+  // has to be answerable afterwards.
   const before = {
     storage: await getConfig('default_storage'),
     bridge: await getConfig('default_bridge'),
@@ -554,6 +602,12 @@ router.put('/settings/rescue', async (req: Request, res: Response) => {
     return;
   }
   await setConfig('rescue_iso', parsed.data.iso.trim());
+  await recordAudit({
+    action: 'admin.rescue_config',
+    actor: (req as AuthRequest).user,
+    detail: parsed.data.iso.trim() || 'rescue ISO cleared',
+    req,
+  });
   res.json({ success: true });
 });
 
@@ -570,6 +624,12 @@ router.put('/settings/template-refresh', async (req: Request, res: Response) => 
     return;
   }
   await setConfig('template_refresh_enabled', String(parsed.data.enabled));
+  await recordAudit({
+    action: 'admin.template_refresh_config',
+    actor: (req as AuthRequest).user,
+    detail: parsed.data.enabled ? 'monthly refresh enabled' : 'monthly refresh disabled',
+    req,
+  });
   res.json({ success: true });
 });
 
@@ -700,6 +760,14 @@ router.put('/isolation', async (req: Request, res: Response) => {
   if (parsed.data.vlanTag !== undefined) {
     await setConfig('isolation_vlan_tag', parsed.data.vlanTag === '' ? '' : String(parsed.data.vlanTag));
   }
+  await recordAudit({
+    action: 'admin.isolation_config',
+    actor: (req as AuthRequest).user,
+    detail: `isolation ${parsed.data.enabled ? 'on' : 'off'}${
+      parsed.data.dnsServers !== undefined ? `, dns: ${parsed.data.dnsServers.trim() || 'any'}` : ''
+    }${parsed.data.vlanTag !== undefined ? `, vlan: ${parsed.data.vlanTag === '' ? 'none' : parsed.data.vlanTag}` : ''}`,
+    req,
+  });
   res.json({ success: true });
 });
 
@@ -717,6 +785,12 @@ router.post('/isolation/enforce', async (req: Request, res: Response) => {
   }
   try {
     await setClusterFirewall(true, [parsed.data.managementCidr]);
+    await recordAudit({
+      action: 'admin.isolation_enforce',
+      actor: (req as AuthRequest).user,
+      detail: `cluster firewall on, management ${parsed.data.managementCidr}`,
+      req,
+    });
     res.json({ success: true, enforced: true });
   } catch (err) {
     res.status(502).json({ error: pveMessage(err) });
@@ -726,9 +800,10 @@ router.post('/isolation/enforce', async (req: Request, res: Response) => {
 // ─── DELETE /api/admin/isolation/enforce ──────────────────────
 // Disable the cluster firewall (stops enforcing; management allow-rules are left in place).
 
-router.delete('/isolation/enforce', async (_req: Request, res: Response) => {
+router.delete('/isolation/enforce', async (req: Request, res: Response) => {
   try {
     await setClusterFirewall(false);
+    await recordAudit({ action: 'admin.isolation_unenforce', actor: (req as AuthRequest).user, detail: 'cluster firewall off', req });
     res.json({ success: true, enforced: false });
   } catch (err) {
     res.status(502).json({ error: pveMessage(err) });
@@ -922,6 +997,37 @@ router.post('/passthrough-requests/:id/deny', async (req: Request, res: Response
 });
 
 const DetachPassthroughSchema = z.object({ index: z.number().int().min(0).max(15).optional() });
+
+// ─── Machines whose guest can't be confirmed as their own ─────
+// Rows whose VMID holds no guest carrying their ProxMate tag (typically created
+// before tags existed and not matched by the startup backfill). Every action on
+// them is refused until an admin adopts the guest or removes the row
+// (DELETE /api/vms/:id?rowOnly=true).
+
+router.get('/vms/unmatched', async (_req: Request, res: Response) => {
+  try {
+    res.json(await listUnmatchedVms());
+  } catch (err) {
+    res.status(502).json({ error: pveMessage(err) });
+  }
+});
+
+router.post('/vms/:id/adopt', async (req: Request, res: Response) => {
+  const user = (req as AuthRequest).user;
+  const vm = await getOwnedVm(req.params['id'] as string, user);
+  if (!vm) { res.status(404).json({ error: 'VM not found' }); return; }
+  try {
+    await adoptGuest(vm);
+    await recordAudit({
+      action: 'vm.adopt', actor: user, targetType: 'vm', targetId: vm.id,
+      detail: `${vm.name} (vmid ${vm.proxmoxVmId}) tagged as this machine's guest`, req,
+    });
+    res.json({ success: true });
+  } catch (err) {
+    if (err instanceof AdoptError) { res.status(409).json({ error: err.message }); return; }
+    res.status(502).json({ error: pveMessage(err) });
+  }
+});
 
 router.post('/vms/:id/passthrough/detach', async (req: Request, res: Response) => {
   const parsed = DetachPassthroughSchema.safeParse(req.body ?? {});

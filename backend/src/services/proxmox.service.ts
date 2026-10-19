@@ -5,13 +5,14 @@ import { access, mkdir, writeFile, rename } from 'node:fs/promises';
 import axios, { AxiosError, type AxiosInstance, type AxiosRequestConfig, type InternalAxiosRequestConfig } from 'axios';
 import { getConfig } from './config.service.js';
 import { proxmoxApiErrors } from '../lib/metrics.js';
+import { envNumber } from '../lib/env-number.js';
 
 // ─── Client builder ───────────────────────────────────────────
 
-const TIMEOUT_MS = Number(process.env['PROXMOX_TIMEOUT_MS'] ?? 15_000);
+const TIMEOUT_MS = envNumber('PROXMOX_TIMEOUT_MS', 15_000, 0);
 // How many times to retry a *transient* failure. Only idempotent reads are retried
 // (see below) so this can never double-submit a VM create/delete.
-const MAX_RETRIES = Math.max(0, Number(process.env['PROXMOX_RETRIES'] ?? 2));
+const MAX_RETRIES = envNumber('PROXMOX_RETRIES', 2, 0);
 const IDEMPOTENT = new Set(['get', 'head', 'options']);
 
 type RetryConfig = InternalAxiosRequestConfig & { _retryCount?: number; _noRetry?: boolean };
@@ -590,16 +591,131 @@ export async function getStorages(client?: AxiosInstance): Promise<PveStorage[]>
   return res.data.data;
 }
 
-export interface PveBridge {
-  iface: string;
-  type: string;
+/**
+ * What a guest NIC's `bridge=` may name. A netN value is comma-separated `key=value`
+ * pairs, so a name containing a comma, an equals sign or whitespace would corrupt the
+ * line rather than move the NIC. Covers Linux bridges (vmbr0), OVS bridges and SDN
+ * VNets (whose IDs are at most 8 lowercase alphanumerics, so always a subset).
+ */
+export const NETWORK_NAME_RE = /^[A-Za-z][A-Za-z0-9_.-]{0,31}$/;
+
+export type GuestNetworkKind = 'bridge' | 'ovs' | 'vnet';
+
+/** Something a guest NIC can be attached to, as the network pickers present it. */
+export interface GuestNetwork {
+  name: string;
+  kind: GuestNetworkKind;
+  /** SDN zone, for a VNet. */
+  zone?: string;
+  /** VNet alias or interface comment, when Proxmox has one. */
+  comment?: string;
+  /**
+   * Nodes it is known to exist on. A local bridge is per node, so one defined on a
+   * single node of a cluster makes every guest placed elsewhere fail to start.
+   */
+  nodes: string[];
 }
 
-export async function getBridges(node?: string, client?: AxiosInstance): Promise<PveBridge[]> {
+interface PveNetworkIface {
+  iface: string;
+  type: string;
+  comments?: string;
+}
+
+interface PveSdnVnet {
+  vnet: string;
+  zone?: string;
+  alias?: string;
+}
+
+interface PveSdnZone {
+  zone: string;
+  /** Comma-separated node restriction; absent means every node. */
+  nodes?: string;
+}
+
+/**
+ * Every network a guest NIC can be attached to, across the whole cluster: Linux and
+ * OVS bridges from each online node, plus SDN VNets.
+ *
+ * This used to ask only the first node for `?type=bridge`, which returns Linux
+ * bridges and nothing else. An SDN-only cluster (VXLAN/EVPN zones, no vmbrN for
+ * guests) therefore got an empty picker and could not finish setup (issue #126), an
+ * OVS cluster got the same, and a bridge missing from some nodes looked fine.
+ *
+ * `any_bridge` covers both bridge types and, on Proxmox VE 8+, also lists applied
+ * VNets; `/cluster/sdn/vnets` is asked as well so VNets appear on older releases and
+ * carry their zone. Either half failing (an offline node, no SDN package, no
+ * SDN.Audit) only drops what it would have added: this feeds a picker, and a partial
+ * list beats none.
+ */
+export async function getGuestNetworks(client?: AxiosInstance): Promise<GuestNetwork[]> {
   const c = client ?? (await getClient());
-  const targetNode = node ?? (await getDefaultNode(c));
-  const res = await c.get<{ data: PveBridge[] }>(`/nodes/${targetNode}/network?type=bridge`);
-  return res.data.data;
+  const nodes = (await getNodes(c)).filter((n) => n.status === 'online').map((n) => n.node);
+
+  const [perNode, vnetsRes, zonesRes] = await Promise.all([
+    Promise.allSettled(
+      nodes.map((node) =>
+        c
+          .get<{ data: PveNetworkIface[] }>(`/nodes/${node}/network?type=any_bridge`)
+          // A release that rejects the filter must not lose the bridges it always had:
+          // the unfiltered list carries them too, filtered by type below.
+          .catch(() => c.get<{ data: PveNetworkIface[] }>(`/nodes/${node}/network`)),
+      ),
+    ),
+    c.get<{ data: PveSdnVnet[] }>('/cluster/sdn/vnets').catch(() => null),
+    c.get<{ data: PveSdnZone[] }>('/cluster/sdn/zones').catch(() => null),
+  ]);
+
+  const byName = new Map<string, GuestNetwork>();
+
+  const zoneNodes = new Map<string, string[]>();
+  for (const z of zonesRes?.data.data ?? []) {
+    const restricted = (z.nodes ?? '').split(',').map((s) => s.trim()).filter(Boolean);
+    zoneNodes.set(z.zone, restricted.length > 0 ? restricted.filter((n) => nodes.includes(n)) : nodes);
+  }
+  for (const v of vnetsRes?.data.data ?? []) {
+    if (!v.vnet) continue;
+    byName.set(v.vnet, {
+      name: v.vnet,
+      kind: 'vnet',
+      ...(v.zone ? { zone: v.zone } : {}),
+      ...(v.alias ? { comment: v.alias } : {}),
+      nodes: (v.zone && zoneNodes.get(v.zone)) || nodes,
+    });
+  }
+
+  perNode.forEach((result, i) => {
+    if (result.status !== 'fulfilled') return;
+    const node = nodes[i]!;
+    for (const iface of result.value.data.data ?? []) {
+      const kind: GuestNetworkKind | null =
+        iface.type === 'bridge' ? 'bridge'
+        : iface.type === 'OVSBridge' ? 'ovs'
+        : iface.type === 'vnet' ? 'vnet'
+        : null;
+      if (!kind || !iface.iface) continue;
+      const existing = byName.get(iface.iface);
+      if (existing) {
+        // Seen on another node already, or a VNet /cluster/sdn listed: a node that
+        // reports it locally definitely has it.
+        if (!existing.nodes.includes(node)) existing.nodes.push(node);
+        continue;
+      }
+      byName.set(iface.iface, {
+        name: iface.iface,
+        kind,
+        ...(iface.comments?.trim() ? { comment: iface.comments.trim() } : {}),
+        nodes: [node],
+      });
+    }
+  });
+
+  const order: Record<GuestNetworkKind, number> = { bridge: 0, ovs: 1, vnet: 2 };
+  return [...byName.values()]
+    .filter((n) => NETWORK_NAME_RE.test(n.name))
+    .map((n) => ({ ...n, nodes: [...n.nodes].sort() }))
+    .sort((a, b) => order[a.kind] - order[b.kind] || a.name.localeCompare(b.name, undefined, { numeric: true }));
 }
 
 export interface PveIso {
@@ -746,6 +862,8 @@ export interface CreateVmConfig {
   bridge: string;
   isoStorage: string;
   iso: string; // ISO filename
+  /** Proxmox tags (`;`-separated) — carries ProxMate's ownership marker. */
+  tags?: string;
 }
 
 /** Create a QEMU VM. Returns the Proxmox task UPID. */
@@ -766,6 +884,7 @@ export async function createVm(config: CreateVmConfig, client?: AxiosInstance): 
     ostype: 'l26',
     agent: '1',
   });
+  if (config.tags) params.set('tags', config.tags);
   const res = await c.post<{ data: string }>(`/nodes/${config.node}/qemu`, params);
   return res.data.data;
 }
@@ -786,6 +905,8 @@ export interface CreateLxcConfig {
   password?: string;
   sshPublicKeys?: string; // OpenSSH public key(s)
   unprivileged?: boolean; // default true
+  /** Proxmox tags (`;`-separated) — carries ProxMate's ownership marker. */
+  tags?: string;
 }
 
 /**
@@ -811,6 +932,7 @@ export async function createLxc(config: CreateLxcConfig, client?: AxiosInstance)
   });
   if (config.password) params.set('password', config.password);
   if (config.sshPublicKeys) params.set('ssh-public-keys', config.sshPublicKeys);
+  if (config.tags) params.set('tags', config.tags);
   const res = await c.post<{ data: string }>(`/nodes/${config.node}/lxc`, params);
   return res.data.data;
 }
@@ -1327,6 +1449,19 @@ export async function cloneVm(
   return res.data.data;
 }
 
+/** A task's current status (`running` / `stopped`, with `exitstatus` once stopped). */
+export async function getTaskStatus(
+  node: string,
+  upid: string,
+  client?: AxiosInstance,
+): Promise<{ status: string; exitstatus?: string }> {
+  const c = client ?? (await getClient());
+  const res = await c.get<{ data: { status: string; exitstatus?: string } }>(
+    `/nodes/${node}/tasks/${encodeURIComponent(upid)}/status`,
+  );
+  return res.data.data;
+}
+
 /** Poll a Proxmox task (UPID) until it finishes; throws if it failed. */
 export async function waitForTask(
   node: string,
@@ -1365,10 +1500,14 @@ export async function setVmResources(
   kind: GuestKind = 'qemu',
 ): Promise<void> {
   const c = client ?? (await getClient());
-  await c.put(
-    `/nodes/${node}/${kind}/${vmid}/config`,
-    new URLSearchParams({ cores: String(cores), memory: String(memory) }),
-  );
+  // A QEMU guest runs sockets × cores vCPUs (or `vcpus` of them). ProxMate's `cpu`
+  // is the total, so it is always written as one socket of that many cores —
+  // otherwise a restored config's `sockets: 4` would multiply every later resize.
+  const params: Record<string, string> =
+    kind === 'qemu'
+      ? { sockets: '1', cores: String(cores), memory: String(memory), delete: 'vcpus' }
+      : { cores: String(cores), memory: String(memory) };
+  await c.put(`/nodes/${node}/${kind}/${vmid}/config`, new URLSearchParams(params));
 }
 
 /** Set a VM's display name (the Proxmox `name`/hostname config field). */
@@ -1578,12 +1717,20 @@ export async function migratePreflight(
     }>(`/nodes/${node}/qemu/${vmid}/migrate`);
     const d = r.data.data ?? {};
 
+    let allowed = d.allowed_nodes ?? [];
+
+    // Proxmox returns BOTH an allow list and a map that mentions every OTHER node,
+    // filling in a cause only where there is one — so `{'pve-3': {}}` arriving
+    // alongside `allowed_nodes: ['pve-3']` is not a refusal, just a node being
+    // listed. Pushing those anyway reported every possible destination as forbidden
+    // while the very same nodes were being offered as targets.
+    const allowedNodes = new Set(allowed);
     const blocked: MigrateBlocker[] = [];
     for (const [name, raw] of Object.entries(d.not_allowed_nodes ?? {})) {
-      blocked.push({ node: name, reason: describeMigrateRefusal(raw) });
+      const reason = describeMigrateRefusal(raw);
+      if (reason === MIGRATE_REFUSAL_UNSPECIFIED && allowedNodes.has(name)) continue;
+      blocked.push({ node: name, reason });
     }
-
-    let allowed = d.allowed_nodes ?? [];
 
     // ── ProxMate's own guardrails, on top of Proxmox's ────────────────────────
     // Proxmox permits both of the migrations below. Both break the guest.
@@ -1663,6 +1810,13 @@ export async function migratePreflight(
   }
 }
 
+/**
+ * Reason text used when Proxmox refuses a node without naming a cause. It doubles
+ * as the "no cause given" marker for {@link migratePreflight}, which must not treat
+ * such an entry as a refusal while the node sits in `allowed_nodes`.
+ */
+export const MIGRATE_REFUSAL_UNSPECIFIED = 'not permitted by Proxmox';
+
 /** Turn one `not_allowed_nodes` entry into a human sentence. */
 export function describeMigrateRefusal(raw: unknown): string {
   if (typeof raw === 'string' && raw.trim()) return raw.trim();
@@ -1679,7 +1833,7 @@ export function describeMigrateRefusal(raw: unknown): string {
     }
     if (parts.length > 0) return parts.join('; ');
   }
-  return 'not permitted by Proxmox';
+  return MIGRATE_REFUSAL_UNSPECIFIED;
 }
 
 /**
@@ -2408,6 +2562,61 @@ export async function startBackup(
   return res.data.data;
 }
 
+/** A task's log lines (all of them — `limit: 0` is Proxmox's "no limit"). */
+export async function getTaskLog(node: string, upid: string, client?: AxiosInstance): Promise<string[]> {
+  const c = client ?? (await getClient());
+  const res = await c.get<{ data: Array<{ t: string }> }>(
+    `/nodes/${node}/tasks/${encodeURIComponent(upid)}/log`,
+    { params: { limit: 0 } },
+  );
+  return (res.data.data ?? []).map((l) => l.t);
+}
+
+/** Stop a running Proxmox task. */
+export async function stopTask(node: string, upid: string, client?: AxiosInstance): Promise<void> {
+  const c = client ?? (await getClient());
+  await c.delete(`/nodes/${node}/tasks/${encodeURIComponent(upid)}`);
+}
+
+/**
+ * The backup volid a vzdump task wrote, read from its own log ("creating vzdump
+ * archive '<path>'", or "creating Proxmox Backup Server archive '<name>'"), or
+ * null when the log doesn't name one.
+ */
+export function backupVolidFromLog(lines: string[], storage: string): string | null {
+  for (const line of lines) {
+    const m = /creating (?:vzdump|Proxmox Backup Server) archive '([^']+)'/.exec(line);
+    if (!m) continue;
+    const archive = m[1]!;
+    // A directory storage logs a file path; its volid names only the file.
+    return `${storage}:backup/${archive.startsWith('/') ? archive.slice(archive.lastIndexOf('/') + 1) : archive}`;
+  }
+  return null;
+}
+
+/**
+ * Every volume Proxmox lists for `vmid` on the storages active on `node` (shared
+ * ones included) — e.g. disks a deleted guest with the same VMID left behind.
+ * Throws when the node's storage list can't be read; a storage whose content
+ * can't be listed is skipped (nothing can be restored onto it either).
+ */
+export async function listGuestVolumes(node: string, vmid: number, client?: AxiosInstance): Promise<Set<string>> {
+  const c = client ?? (await getClient());
+  const res = await c.get<{ data: Array<{ storage: string }> }>(`/nodes/${node}/storage`, { params: { enabled: 1 } });
+  const out = new Set<string>();
+  for (const { storage } of res.data.data ?? []) {
+    try {
+      const content = await c.get<{ data: Array<{ volid: string }> }>(`/nodes/${node}/storage/${storage}/content`, {
+        params: { vmid },
+      });
+      for (const v of content.data.data ?? []) if (v.volid) out.add(v.volid);
+    } catch {
+      /* not listable here */
+    }
+  }
+  return out;
+}
+
 export interface PveBackup {
   volid: string;
   storage: string;
@@ -2509,6 +2718,9 @@ export async function restoreNewGuest(
   if (kind === 'lxc') {
     params.set('ostemplate', opts.volid);
     params.set('restore', '1');
+    // Same as createContainer: a tenant's container is always unprivileged,
+    // whatever the archive's own config says.
+    params.set('unprivileged', '1');
   } else {
     params.set('archive', opts.volid);
   }
@@ -2620,6 +2832,22 @@ export async function deleteSnapshot(
   return res.data.data;
 }
 
+/** The guest config a snapshot holds (what a rollback to it brings back). */
+export async function getSnapshotConfig(
+  node: string,
+  vmid: number,
+  snapname: string,
+  client?: AxiosInstance,
+): Promise<Record<string, string>> {
+  const c = client ?? (await getClient());
+  const res = await c.get<{ data: Record<string, unknown> }>(
+    `/nodes/${node}/qemu/${vmid}/snapshot/${encodeURIComponent(snapname)}/config`,
+  );
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(res.data.data ?? {})) out[k] = String(v);
+  return out;
+}
+
 /** Roll the VM back to a snapshot (reverts disk + RAM if captured). Task UPID. */
 export async function rollbackSnapshot(
   node: string,
@@ -2645,11 +2873,24 @@ export async function ensureNicFirewall(
   const c = client ?? (await getClient());
   const cfg = await getVmConfig(node, vmid, c, kind);
   for (const k of Object.keys(cfg).filter((key) => /^net\d+$/.test(key))) {
-    const val = cfg[k]!;
-    if (/\bfirewall=1\b/.test(val)) continue;
-    const updated = /\bfirewall=0\b/.test(val) ? val.replace(/\bfirewall=0\b/, 'firewall=1') : `${val},firewall=1`;
+    const val = withoutTrunks(cfg[k]!);
+    const updated = /\bfirewall=1\b/.test(val)
+      ? val
+      : /\bfirewall=0\b/.test(val)
+        ? val.replace(/\bfirewall=0\b/, 'firewall=1')
+        : `${val},firewall=1`;
+    if (updated === cfg[k]) continue;
     await c.put(`/nodes/${node}/${kind}/${vmid}/config`, new URLSearchParams({ [k]: updated }));
   }
+}
+
+/**
+ * A NIC line without `trunks=`. Trunks let a guest's NIC carry several VLANs, i.e.
+ * reach segments other than the one tenant isolation puts it on — a tenant guest
+ * never gets them, whatever its config (a restored archive or snapshot) says.
+ */
+export function withoutTrunks(nic: string): string {
+  return nic.replace(/,?\btrunks=[^,]*/g, '').replace(/^,/, '');
 }
 
 /**
@@ -2686,17 +2927,21 @@ export async function setVmVlanTag(
   const c = client ?? (await getClient());
   const cfg = await getVmConfig(node, vmid, c, kind);
   for (const k of Object.keys(cfg).filter((key) => /^net\d+$/.test(key))) {
-    const val = cfg[k]!;
+    // Never leave trunks on a tenant NIC (see withoutTrunks).
+    const val = withoutTrunks(cfg[k]!);
     const current = /\btag=(\d+)\b/.exec(val);
     if (tag === null) {
-      if (!current) continue;
+      if (!current && val === cfg[k]) continue;
       await c.put(
         `/nodes/${node}/${kind}/${vmid}/config`,
         new URLSearchParams({ [k]: val.replace(/,?\btag=\d+\b/, '') }),
       );
       continue;
     }
-    if (current && Number(current[1]) === tag) continue;
+    if (current && Number(current[1]) === tag) {
+      if (val !== cfg[k]) await c.put(`/nodes/${node}/${kind}/${vmid}/config`, new URLSearchParams({ [k]: val }));
+      continue;
+    }
     const updated = current ? val.replace(/\btag=\d+\b/, `tag=${tag}`) : `${val},tag=${tag}`;
     await c.put(`/nodes/${node}/${kind}/${vmid}/config`, new URLSearchParams({ [k]: updated }));
   }
@@ -2740,9 +2985,7 @@ export async function setVmBridge(
   client?: AxiosInstance,
   kind: GuestKind = 'qemu',
 ): Promise<void> {
-  // A netN value is comma-separated `key=value` pairs, so a name containing a comma,
-  // an equals sign or whitespace would corrupt the line rather than move the NIC.
-  if (!/^[A-Za-z][A-Za-z0-9_.-]{0,31}$/.test(bridge)) {
+  if (!NETWORK_NAME_RE.test(bridge)) {
     throw new Error(`Invalid bridge name "${bridge}" — expected something like "vmbr0".`);
   }
   const c = client ?? (await getClient());
@@ -2820,12 +3063,10 @@ export async function getBridgeGateway(
 /** Whether the cluster-wide firewall is enabled (required for guest firewalls to take effect). */
 export async function isClusterFirewallEnabled(client?: AxiosInstance): Promise<boolean> {
   const c = client ?? (await getClient());
-  try {
-    const res = await c.get<{ data: { enable?: number } }>('/cluster/firewall/options');
-    return res.data.data.enable === 1;
-  } catch {
-    return false;
-  }
+  // Errors propagate: a caller must be able to tell "the firewall is off" apart
+  // from "Proxmox could not be asked" (the isolation page shows them differently).
+  const res = await c.get<{ data: { enable?: number } }>('/cluster/firewall/options');
+  return res.data.data.enable === 1;
 }
 
 /** Get a bridge's gateway and CIDR (e.g. for deriving the management subnet). */
@@ -3259,7 +3500,7 @@ export async function ensureHostCpu(
   kind: GuestKind = 'qemu',
 ): Promise<boolean> {
   const c = client ?? (await getClient());
-  const cfg = await getVmConfig(node, vmid, c);
+  const cfg = await getVmConfig(node, vmid, c, kind);
   const current = String((cfg as Record<string, unknown>)['cpu'] ?? '');
   if (current.split(',')[0] === 'host') return false;
   await c.put(`/nodes/${node}/${kind}/${vmid}/config`, new URLSearchParams({ cpu: 'host' }));

@@ -1,21 +1,15 @@
 import 'dotenv/config';
-import { randomBytes } from 'node:crypto';
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { ensureEncryptionKey } from './lib/encryption-key.js';
 
-// Auto-generate ENCRYPTION_KEY on first run and persist it to .env
-if (!process.env.ENCRYPTION_KEY) {
-  const key = randomBytes(32).toString('hex');
-  process.env.ENCRYPTION_KEY = key;
-  const envPath = resolve(process.cwd(), '.env');
-  if (existsSync(envPath)) {
-    let content = readFileSync(envPath, 'utf8');
-    content = content.includes('ENCRYPTION_KEY=')
-      ? content.replace(/^ENCRYPTION_KEY=.*$/m, `ENCRYPTION_KEY=${key}`)
-      : content + `\nENCRYPTION_KEY=${key}`;
-    writeFileSync(envPath, content, 'utf8');
-  }
-  console.log('Generated and saved ENCRYPTION_KEY to .env');
+// A missing ENCRYPTION_KEY is generated only when it can be persisted (a dev
+// .env); otherwise refuse to start rather than run on a key the next restart
+// will not have. See lib/encryption-key.ts.
+try {
+  const k = ensureEncryptionKey();
+  if (k.generated) console.log(`Generated ENCRYPTION_KEY and saved it to ${k.savedTo}`);
+} catch (err) {
+  console.error((err as Error).message);
+  process.exit(1);
 }
 
 import http from 'node:http';
@@ -26,6 +20,7 @@ import { handleConsoleUpgrade } from './routes/console.routes.js';
 import { handleIdeUpgrade } from './services/ide-proxy.service.js';
 import { startScheduler } from './services/scheduler.service.js';
 import { reconcileInterruptedPassthroughApplies } from './services/passthrough-request.service.js';
+import { runGuestMarkerBackfill } from './services/vm.service.js';
 
 const PORT = parseInt(process.env.PORT || '4000', 10);
 // Default to 0.0.0.0 so the port is reachable by the reverse proxy and sibling
@@ -74,4 +69,10 @@ server.listen(PORT, BIND_ADDR, () => {
   void reconcileInterruptedPassthroughApplies().catch((err) =>
     logger.error({ err }, 'passthrough startup reconcile failed'),
   );
+  // Tag guests created before ProxMate's ownership tag existed (idempotent; only
+  // unambiguous matches are tagged, the rest are listed for an admin). The
+  // scheduler repeats this until a pass completes without a Proxmox error.
+  void runGuestMarkerBackfill()
+    .then((r) => logger.info(r, 'guest ownership tag backfill done'))
+    .catch((err) => logger.error({ err }, 'guest ownership tag backfill failed'));
 });

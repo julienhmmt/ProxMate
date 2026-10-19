@@ -10,8 +10,12 @@ import {
   completeSetup,
   hasAdmin,
 } from '../services/setup.service.js';
+import { NETWORK_NAME_RE } from '../services/proxmox.service.js';
 import { setAuthCookies } from '../lib/cookies.js';
 import { authLimiter } from '../middleware/rate-limit.js';
+import { requireAuth } from '../middleware/auth.js';
+import { requireAdmin } from '../middleware/admin.js';
+import type { AuthRequest } from '../types/index.js';
 
 const router = Router();
 
@@ -70,6 +74,15 @@ router.post('/admin', async (req: Request, res: Response) => {
   }
 });
 
+// ─── Guard: every later step needs the admin's session ───────
+
+// Step 1 is the only step open to an anonymous caller: it creates the single
+// admin and gives that browser a session. Everything after it (cluster
+// credentials, defaults, finishing) is admin configuration, so it requires that
+// session (cookie + CSRF header) like any other admin write. An operator who
+// lost the step-1 session signs in normally and the wizard picks up again.
+router.use(requireAuth, requireAdmin);
+
 // ─── Step 2: Save Proxmox connection config ───────────────────
 
 const ProxmoxConfigSchema = z.object({
@@ -122,7 +135,9 @@ router.get('/proxmox/resources', async (_req: Request, res: Response) => {
 
 const DefaultsSchema = z.object({
   storage: z.string().min(1),
-  bridge: z.string().min(1),
+  // May be typed by hand when discovery can't list it, so it gets the same check the
+  // NIC writer applies rather than failing later on every deploy.
+  bridge: z.string().trim().regex(NETWORK_NAME_RE, "Network names start with a letter and use only letters, digits, '.', '_' or '-' (max 32), e.g. vmbr0 or a VNet ID."),
   isoStorage: z.string().min(1),
 });
 
@@ -143,11 +158,10 @@ router.post('/defaults', async (req: Request, res: Response) => {
 
 // ─── Step 4: Finalize setup ───────────────────────────────────
 
-router.post('/complete', async (_req: Request, res: Response) => {
+router.post('/complete', async (req: Request, res: Response) => {
   try {
-    const result = await completeSetup();
-    setAuthCookies(res, result.token, result.csrfToken, result.expiresAt);
-    res.json({ user: result.user, redirectTo: '/' });
+    await completeSetup();
+    res.json({ user: (req as AuthRequest).user, redirectTo: '/' });
   } catch (err) {
     const msg = err instanceof Error ? err.message : 'Setup completion failed';
     res.status(500).json({ error: msg });

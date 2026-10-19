@@ -4,7 +4,11 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 // proxmox.service request-builders run against a fake axios; only the DB, config
 // reads, and the client factory are mocked.
 vi.mock('../../src/lib/prisma.js', () => ({
-  prisma: { virtualMachine: { update: vi.fn(), findMany: vi.fn(), delete: vi.fn() } },
+  prisma: {
+    virtualMachine: { update: vi.fn(), findMany: vi.fn(), delete: vi.fn() },
+    mateState: { count: vi.fn(async () => 0) },
+    user: { findUnique: vi.fn(async () => null) },
+  },
 }));
 vi.mock('../../src/services/config.service.js', () => ({ getConfig: vi.fn() }));
 vi.mock('../../src/services/proxmox.service.js', async (importOriginal) => {
@@ -15,7 +19,7 @@ vi.mock('../../src/services/proxmox.service.js', async (importOriginal) => {
 import { prisma } from '../../src/lib/prisma.js';
 import { getConfig } from '../../src/services/config.service.js';
 import * as pve from '../../src/services/proxmox.service.js';
-import { rebuildVm, QuotaError, type RebuildSource } from '../../src/services/vm.service.js';
+import { rebuildVm, QuotaError, QUOTA_HOLD_MESSAGE, type RebuildSource } from '../../src/services/vm.service.js';
 import { bodyOf, GB } from '../helpers.js';
 import type { Template } from '@prisma/client';
 
@@ -50,7 +54,11 @@ function fakePve() {
       if (/\/status\/current$/.test(url)) return ok({ status: 'stopped' });
       // getVmConfig (template autoscale) — a primary disk + a cloud-init cdrom.
       if (/\/qemu\/\d+\/config$/.test(url))
-        return ok({ scsi0: 'local-lvm:vm-110-disk-0,size=2G', ide2: 'local-lvm:vm-110-cloudinit,media=cdrom' });
+        return ok({
+          tags: 'proxmate-vm-1', // the row's own guest
+          scsi0: 'local-lvm:vm-110-disk-0,size=2G',
+          ide2: 'local-lvm:vm-110-cloudinit,media=cdrom',
+        });
       if (/\/tasks\/.+\/status/.test(url)) return ok({ status: 'stopped', exitstatus: 'OK' });
       return ok(null);
     }),
@@ -88,6 +96,7 @@ const TEMPLATE = {
 beforeEach(() => {
   vi.clearAllMocks();
   getConfigMock.mockImplementation(async (k: string) => DEFAULTS[k] ?? null);
+  del.mockResolvedValue({} as never);
   update.mockImplementation(async ({ data }: { data: Record<string, unknown> }) => ({ ...(VM as object), ...data }) as never);
 });
 
@@ -122,7 +131,64 @@ describe('rebuildVm — ISO reinstall', () => {
     getClientMock.mockResolvedValue(client as never);
 
     await expect(rebuildVm(admin, VM, { kind: 'iso', os: 'debian.iso' })).rejects.toThrow('pve create failed');
-    expect(update).toHaveBeenCalledWith({ where: { id: 'vm-1' }, data: { status: 'error' } });
+    expect(update).toHaveBeenCalledWith({ where: { id: 'vm-1' }, data: expect.objectContaining({ status: 'error', holdReason: expect.any(String) }) });
+  });
+});
+
+describe('rebuildVm — guest identity', () => {
+  it('refuses (and tears nothing down) when the VMID holds another row\'s guest', async () => {
+    const client = fakePve();
+    const base = client.get.getMockImplementation()!;
+    client.get.mockImplementation((url: string) =>
+      /\/qemu\/110\/config$/.test(url)
+        ? Promise.resolve({ data: { data: { name: 'box', tags: 'proxmate-someotherrow' } } })
+        : base(url),
+    );
+    getClientMock.mockResolvedValue(client as never);
+
+    await expect(rebuildVm(admin, VM, { kind: 'iso', os: 'debian.iso' })).rejects.toThrow(/not the one ProxMate created/);
+    expect(client.delete).not.toHaveBeenCalled();
+    expect(client.post).not.toHaveBeenCalled();
+  });
+});
+
+describe('rebuildVm — failure after teardown', () => {
+  /** The guest is ours until teardown deletes it; the re-create then never lands. */
+  function failingRebuild() {
+    const client = fakePve();
+    const base = client.get.getMockImplementation()!;
+    let deleted = false;
+    client.delete = vi.fn(() => {
+      deleted = true;
+      return Promise.resolve({ data: { data: 'UPID:del' } });
+    });
+    client.get.mockImplementation((url: string) =>
+      deleted && /\/qemu\/110\/config$/.test(url)
+        ? Promise.reject(new Error("Configuration file 'nodes/pve-x/qemu-server/110.conf' does not exist"))
+        : base(url),
+    );
+    client.post = vi.fn((url: string) =>
+      url === '/nodes/pve-x/qemu'
+        ? Promise.reject(new Error('pve create failed'))
+        : Promise.resolve({ data: { data: 'UPID:task' } }),
+    );
+    getClientMock.mockResolvedValue(client as never);
+    return client;
+  }
+
+  it('drops the row when nothing of ours is left at the (now free) VMID and it has no backups', async () => {
+    failingRebuild();
+    await expect(rebuildVm(admin, VM, { kind: 'iso', os: 'debian.iso' })).rejects.toThrow('pve create failed');
+    expect(del).toHaveBeenCalledWith({ where: { id: 'vm-1' } });
+    expect(update).not.toHaveBeenCalledWith({ where: { id: 'vm-1' }, data: expect.objectContaining({ status: 'error', holdReason: expect.any(String) }) });
+  });
+
+  it('keeps the row in error when it has backups to restore from', async () => {
+    failingRebuild();
+    vi.mocked(prisma.mateState.count).mockResolvedValueOnce(2 as never);
+    await expect(rebuildVm(admin, VM, { kind: 'iso', os: 'debian.iso' })).rejects.toThrow('pve create failed');
+    expect(del).not.toHaveBeenCalled();
+    expect(update).toHaveBeenCalledWith({ where: { id: 'vm-1' }, data: expect.objectContaining({ status: 'error', holdReason: expect.any(String) }) });
   });
 });
 
@@ -151,6 +217,21 @@ describe('rebuildVm — template / cloud-init redeploy', () => {
 
     expect(client.post).toHaveBeenCalledWith('/nodes/pve-x/qemu/110/status/start');
     expect(result.status).toBe('running');
+  });
+
+  it('on a machine held for being over quota, is judged on the full quota before anything is torn down (audit round 3)', async () => {
+    const client = fakePve();
+    getClientMock.mockResolvedValue(client as never);
+    findMany.mockResolvedValue([] as never);
+    const held = { ...(VM as object), status: 'error', storage: 30, holdReason: QUOTA_HOLD_MESSAGE } as never;
+
+    const tight = { id: 'u1', role: 'user', maxCpu: 8, maxRam: 16384, maxStorage: 20 } as never;
+    await expect(rebuildVm(tight, held, { kind: 'iso', os: 'debian.iso' })).rejects.toBeInstanceOf(QuotaError);
+    expect(client.delete).not.toHaveBeenCalled();
+
+    const roomy = { id: 'u1', role: 'user', maxCpu: 8, maxRam: 16384, maxStorage: 40 } as never;
+    await rebuildVm(roomy, held, { kind: 'iso', os: 'debian.iso' });
+    expect(update).toHaveBeenCalledWith({ where: { id: 'vm-1' }, data: { status: 'stopped', holdReason: null } });
   });
 
   it('rejects (and does NOT tear down) when a larger template disk exceeds quota', async () => {

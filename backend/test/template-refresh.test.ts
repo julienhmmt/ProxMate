@@ -3,9 +3,10 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 // Mock every Proxmox call the import pipeline makes, plus config + prisma, so the
 // real refreshTemplate orchestration runs without network/DB.
 vi.mock('../src/lib/prisma.js', () => ({
-  prisma: { template: { findUnique: vi.fn(), update: vi.fn() } },
+  prisma: { template: { findUnique: vi.fn(), update: vi.fn(), upsert: vi.fn() } },
 }));
 vi.mock('../src/services/config.service.js', () => ({ getConfig: vi.fn() }));
+vi.mock('../src/services/notify.service.js', () => ({ notify: vi.fn(async () => undefined) }));
 vi.mock('../src/services/proxmox.service.js', () => ({
   getClient: vi.fn(async () => ({})),
   pickBestNode: vi.fn(async () => 'pve-0'),
@@ -13,7 +14,10 @@ vi.mock('../src/services/proxmox.service.js', () => ({
   getNextVmId: vi.fn(async () => 9100),
   downloadUrlToStorage: vi.fn(async () => 'UPID:dl'),
   createCloudInitVm: vi.fn(async () => 'UPID:create'),
-  getVmConfig: vi.fn(async () => ({ scsi0: 'local:vm-9100-disk-0,size=8G' })),
+  // The old template (9000) carries its template tag; the new build (9100) has none yet.
+  getVmConfig: vi.fn(async (_node: string, vmid: number) =>
+    vmid === 9000 ? { template: '1', tags: 'proxmate-template-t1' } : { scsi0: 'local:vm-9100-disk-0,size=8G' },
+  ),
   primaryDiskSizeGb: vi.fn(() => 8),
   convertToTemplate: vi.fn(async () => undefined),
   deleteStorageVolume: vi.fn(async () => undefined),
@@ -37,7 +41,8 @@ vi.mock('../src/services/proxmox.service.js', () => ({
 import { prisma } from '../src/lib/prisma.js';
 import { getConfig } from '../src/services/config.service.js';
 import * as pve from '../src/services/proxmox.service.js';
-import { refreshTemplate } from '../src/services/template.service.js';
+import { refreshTemplate, addCloudImage } from '../src/services/template.service.js';
+import { notify } from '../src/services/notify.service.js';
 
 const findUnique = vi.mocked(prisma.template.findUnique);
 const update = vi.mocked(prisma.template.update);
@@ -86,5 +91,72 @@ describe('refreshTemplate', () => {
   it('throws a clear error for an unknown template', async () => {
     findUnique.mockResolvedValue(null as never);
     await expect(refreshTemplate('nope')).rejects.toThrow(/not found/i);
+  });
+});
+
+describe('refreshTemplate and the old template guest', () => {
+  it('does not delete the old VMID when the guest there no longer carries this template\'s tag', async () => {
+    findUnique.mockResolvedValue(cloudTpl());
+    vi.mocked(pve.getVmConfig).mockImplementation(async (_node: string, vmid: number) =>
+      vmid === 9000 ? { name: 'tenant-vm', tags: 'proxmate-rowb' } : { scsi0: 'local:vm-9100-disk-0,size=8G' },
+    );
+    await refreshTemplate('t1');
+    expect(deleteVm).not.toHaveBeenCalledWith('pve-2', 9000, expect.anything());
+    expect(notify).toHaveBeenCalledWith(expect.objectContaining({ message: expect.stringMatching(/9000/) }));
+  });
+
+  it('skips the delete quietly when the old guest is already gone', async () => {
+    findUnique.mockResolvedValue(cloudTpl());
+    vi.mocked(pve.getVmConfig).mockImplementation(async (_node: string, vmid: number) => {
+      if (vmid === 9000) throw new Error('Configuration file does not exist');
+      return { scsi0: 'local:vm-9100-disk-0,size=8G' };
+    });
+    await refreshTemplate('t1');
+    expect(deleteVm).not.toHaveBeenCalledWith('pve-2', 9000, expect.anything());
+    expect(notify).not.toHaveBeenCalled();
+  });
+});
+
+describe('cloud-image build VMID handling', () => {
+  it('takes the VMID only after the image download finishes', async () => {
+    findUnique.mockResolvedValue(cloudTpl());
+    await refreshTemplate('t1');
+    const dl = vi.mocked(pve.downloadUrlToStorage).mock.invocationCallOrder[0]!;
+    const id = vi.mocked(pve.getNextVmId).mock.invocationCallOrder[0]!;
+    expect(id).toBeGreaterThan(dl);
+  });
+
+  it('never deletes the VMID when its own create failed (the id may belong to another guest)', async () => {
+    findUnique.mockResolvedValue(cloudTpl());
+    vi.mocked(pve.createCloudInitVm).mockRejectedValueOnce(new Error('VM 9100 already exists'));
+    await expect(refreshTemplate('t1')).rejects.toThrow(/already exists/);
+    expect(deleteVm).not.toHaveBeenCalled();
+  });
+
+  it('cleans up its own half-built VM when a later step fails', async () => {
+    findUnique.mockResolvedValue(cloudTpl());
+    vi.mocked(pve.convertToTemplate).mockRejectedValueOnce(new Error('convert failed'));
+    await expect(refreshTemplate('t1')).rejects.toThrow(/convert failed/);
+    expect(deleteVm).toHaveBeenCalledWith('pve-0', 9100, expect.anything());
+  });
+});
+
+describe('template ownership tag', () => {
+  it('tags the rebuilt template guest as a template (never a machine)', async () => {
+    findUnique.mockResolvedValue(cloudTpl());
+    const put = vi.fn(async () => ({ data: { data: '' } }));
+    vi.mocked(pve.getClient).mockResolvedValue({ put } as never);
+    await refreshTemplate('t1');
+    const call = (put.mock.calls as unknown as Array<[string, URLSearchParams]>).find((c) => c[0] === '/nodes/pve-0/qemu/9100/config');
+    expect(call![1].get('tags')).toBe('proxmate-template-t1');
+  });
+
+  it('tags a newly built template guest when it is registered', async () => {
+    vi.mocked(prisma.template.upsert).mockResolvedValue({ id: 'tnew', proxmoxVmId: 9100, proxmoxNode: 'pve-0' } as never);
+    const put = vi.fn(async () => ({ data: { data: '' } }));
+    vi.mocked(pve.getClient).mockResolvedValue({ put } as never);
+    await addCloudImage({ name: 'Debian', imageUrl: 'https://cloud.example/debian.img' } as never);
+    const call = (put.mock.calls as unknown as Array<[string, URLSearchParams]>).find((c) => c[0] === '/nodes/pve-0/qemu/9100/config');
+    expect(call![1].get('tags')).toBe('proxmate-template-tnew');
   });
 });

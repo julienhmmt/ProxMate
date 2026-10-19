@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { getConfig, setConfig } from './config.service.js';
 
 /**
@@ -119,6 +119,17 @@ function parseSharedModels(v: string | null): SharedModel[] {
 
 const VISIBILITIES: readonly ModelVisibility[] = ['admin', 'shared', 'none'];
 
+/**
+ * Id for a stored model that has none (legacy or hand-edited data). Derived from
+ * its fields and position so the same entry gets the same id on every read: the
+ * picker sends this id back, and a fresh random one would never resolve. The
+ * admin's next save persists it.
+ */
+function derivedModelId(m: Record<string, unknown>, index: number): string {
+  const h = createHash('sha256').update(`${index}\0${String(m['sourceKeyId'])}\0${String(m['model'])}`).digest('hex');
+  return `local-${h.slice(0, 16)}`;
+}
+
 /** Tolerant parse of the stored local-models JSON; bad/legacy data → []. */
 function parseLocalModels(v: string | null): LocalModel[] {
   if (!v) return [];
@@ -133,11 +144,11 @@ function parseLocalModels(v: string | null): LocalModel[] {
           typeof (m as { model?: unknown }).model === 'string' &&
           typeof (m as { sourceKeyId?: unknown }).sourceKeyId === 'string',
       )
-      .map((m) => {
+      .map((m, i) => {
         const nickname = typeof m['nickname'] === 'string' ? m['nickname'].trim() : '';
         const vis = m['visibility'];
         return {
-          id: typeof m['id'] === 'string' && m['id'] ? String(m['id']) : randomUUID(),
+          id: typeof m['id'] === 'string' && m['id'] ? String(m['id']) : derivedModelId(m, i),
           ...(nickname ? { nickname } : {}),
           model: String(m['model']),
           sourceKeyId: String(m['sourceKeyId']),
@@ -202,6 +213,21 @@ export async function saveIdeConfig(data: {
   if (data.ingressCidr !== undefined) {
     await setConfig('ide_ingress_cidr', data.ingressCidr.trim());
   }
+}
+
+/**
+ * The IDE runs as root inside the guest, and the guest's root user (the VM's
+ * owner) controls everything it serves and everything handed to it. So it is
+ * opened, provisioned and given a gateway token only for the VM's OWNER: an
+ * admin or a sharee opening it would expose their own session or credentials to
+ * the owner's guest. Everyone else gets this refusal.
+ */
+export const IDE_OWNER_ONLY_MESSAGE =
+  "Only this VM's owner can open its ProxMate IDE. Ask the owner, or use the console instead.";
+
+/** True when `user` owns `vm` (the only principal the IDE serves). */
+export function isIdeOwner(vm: { userId: string }, user: { id: string }): boolean {
+  return vm.userId === user.id;
 }
 
 /** What a given user may do with the IDE — no secrets, safe to hand the client. */

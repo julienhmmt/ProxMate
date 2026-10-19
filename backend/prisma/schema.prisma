@@ -16,10 +16,19 @@ model User {
 
   // SSO (OIDC) link — the provider's stable `sub` claim, set on first SSO login.
   ssoSubject    String?   @unique
+  // True when ProxMate knows the address belongs to this person: it was bound
+  // by an addressed invite (registration must use that address), entered by the
+  // operator at setup, or asserted verified by the IdP at SSO sign-up. SSO links
+  // an IdP identity to an existing account by email only when this is set.
+  emailBound    Boolean   @default(false)
 
   // Two-factor auth (TOTP). `twoFactorSecret` is the AES-encrypted base32 secret.
   twoFactorEnabled Boolean  @default(false)
   twoFactorSecret  String?
+  // A secret from a setup that has not been confirmed yet (same encryption). It
+  // replaces twoFactorSecret only when enable() verifies a code from it, so an
+  // unfinished setup never turns the active factor off.
+  twoFactorPendingSecret String?
   // Admin-enforced (via the invite): user must set up a 2FA method before using ProxMate.
   require2fa       Boolean  @default(false)
 
@@ -27,6 +36,10 @@ model User {
   // window. Reset on any successful password verification; auto-expires.
   failedLoginAttempts Int       @default(0)
   lockedUntil         DateTime?
+  // Wrong 2FA codes at login. Kept apart from failedLoginAttempts because a
+  // correct password must not reset it; cleared only by a completed 2FA login.
+  // Reaching the threshold applies the same lockedUntil window.
+  twoFactorFailedAttempts Int   @default(0)
 
   // Resource Quotas (set from invite token at registration)
   maxCpu        Int       @default(0)      // total vCPU cores allowed
@@ -136,6 +149,19 @@ model IdeGatewayToken {
   @@index([vmId])
 }
 
+// Per-VM credential for the in-guest IDE (code-server). The guest holds only its
+// SHA-256 (as code-server's HASHED_PASSWORD); the backend keeps the secret itself,
+// AES-256-GCM encrypted under ENCRYPTION_KEY, to prove the guest before proxying
+// and to authenticate every proxied request. Rotated on every (re)provision.
+// Keyed by VM id (no relation, like IdeGatewayToken). No row = an install that
+// predates guest authentication: the proxy refuses it until it is reinstalled.
+model IdeGuestSecret {
+  vmId      String   @id
+  secretEnc String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
 // A tenant's own LLM provider API key (bring-your-own), used ONLY through the
 // ProxMate gateway (single controlled egress + audit + rate-limit). The key is
 // AES-256-GCM encrypted at rest (keyEnc) under ENCRYPTION_KEY and only decrypted
@@ -190,7 +216,9 @@ model Session {
 model InviteToken {
   id          String    @id @default(cuid())
   token       String    @unique
-  createdById String
+  // NULL once the admin who issued it has been deleted: a redeemed invite is kept
+  // as the record of how its tenant joined, and must not block that deletion.
+  createdById String?
   label       String?
   email       String?   // address the invite link was emailed to, if any
 
@@ -210,7 +238,7 @@ model InviteToken {
   expiresAt   DateTime
   createdAt   DateTime  @default(now())
 
-  createdBy   User      @relation("CreatedInvites", fields: [createdById], references: [id])
+  createdBy   User?     @relation("CreatedInvites", fields: [createdById], references: [id], onDelete: SetNull)
   usedBy      User?     @relation("UsedInvite", fields: [usedById], references: [id])
 
   @@index([token])
@@ -240,6 +268,10 @@ model VirtualMachine {
   os            String
 
   status        String    @default("creating") // creating | running | stopped | error
+  // Set while the guest may not run (a provision or restore didn't finish, or a
+  // restore left it over quota): why, and what the owner can do. Only repair
+  // paths clear it — never a live-status sync or a power action. Null otherwise.
+  holdReason    String?
   ipAddress     String?
 
   // The guest's Tailscale address (100.64.0.0/10), when Tailscale runs inside it —

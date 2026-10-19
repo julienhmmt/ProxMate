@@ -36,9 +36,12 @@ import { SiTailscale } from "react-icons/si";
 import { TemplateIcon } from "@/components/template-icon";
 import { api, apiBaseUrl, apiError } from "@/lib/api";
 import type { IdeCapability, IdeStatus, VmDetail } from "@/lib/types";
+import { openReadyIde } from "@/lib/ide-open";
 import { copyText } from "@/lib/clipboard";
+import { openPopup, pollUntil } from "@/lib/ide-launch";
 import { formatRam, formatBytes, formatUptime, formatDate } from "@/lib/format";
 import { VmStatusBadge } from "@/components/vm/vm-status-badge";
+import { HoldBanner, isVmHeld } from "@/components/vm/hold-banner";
 import { NotesCard } from "@/components/vm/notes-card";
 import { TagsCard } from "@/components/vm/tags-card";
 import { MetricsCard } from "@/components/vm/metrics-card";
@@ -172,35 +175,70 @@ export default function VmDetailPage() {
   // locked (the backend rejects console/stop/delete) and we show a loading state,
   // then open the editor once the guest is serving.
   const [ideInstalling, setIdeInstalling] = useState(false);
+  // The install / relocate waits run for minutes; they stop once the page is left.
+  const pageAlive = useRef(true);
+  useEffect(() => {
+    pageAlive.current = true;
+    return () => {
+      pageAlive.current = false;
+    };
+  }, []);
 
   async function openIde() {
     if (!vm) return;
-    const popup = () =>
-      window.open(`${apiBaseUrl}/ide/${vm.id}/proxy/`, `proxmate-ide-${vm.id}`, "popup,width=1500,height=940");
+    const vmId = vm.id;
+    const proxyUrl = `${apiBaseUrl}/ide/${vmId}/proxy/`;
+    const windowName = `proxmate-ide-${vmId}`;
+    const features = "popup,width=1500,height=940";
+    const openWindow = (url: string) => window.open(url, windowName, features);
+    const popup = () => openPopup(proxyUrl, windowName, features);
+    // The browser only allows a pop-up shortly after a click, so after a long wait
+    // (or if a blocker refused it) hand the user a button that opens it from a fresh click.
+    const popupOrOffer = (message: string) => {
+      if (popup()) return;
+      toast.success(message, {
+        action: { label: "Open IDE", onClick: () => void popup() },
+        duration: 60_000,
+      });
+    };
     if (vm.ideState === "ready") {
-      popup();
-      return;
+      // An install from an older ProxMate has no per-VM guest credential and the
+      // proxy won't open it, so reinstall it (the same flow as a first install).
+      // The window opens before the check so the click still allows the popup.
+      const result = await openReadyIde({
+        open: openWindow,
+        proxyUrl,
+        checkReinstall: () =>
+          api.get<IdeStatus>(`/ide/${vmId}/status`).then((r) => !!r.data.reinstallRequired),
+      });
+      if (result === "opened") return;
+      if (result === "blocked") {
+        popupOrOffer("ProxMate IDE is ready.");
+        return;
+      }
+      toast.info("This IDE was installed by an older ProxMate version and needs a reinstall before it can open. Reinstalling now…");
     }
     setIdeInstalling(true);
     try {
-      await api.post(`/ide/${vm.id}/provision`, {});
+      await api.post(`/ide/${vmId}/provision`, {});
       toast.info("Installing the ProxMate IDE — this takes about a minute…");
-      const deadline = Date.now() + 12 * 60 * 1000;
-      while (Date.now() < deadline) {
-        await new Promise((r) => setTimeout(r, 3000));
-        const state = await api
-          .get<IdeStatus>(`/ide/${vm.id}/status`)
-          .then((r) => r.data.state)
-          .catch(() => "installing" as const);
-        if (state === "ready") {
-          toast.success("ProxMate IDE is ready.");
-          popup();
-          break;
-        }
-        if (state === "failed") {
-          toast.error("The IDE install didn't finish. Check the VM and try again.");
-          break;
-        }
+      const r = await pollUntil({
+        fetch: () =>
+          api
+            .get<IdeStatus>(`/ide/${vmId}/status`)
+            .then((res) => res.data.state)
+            .catch(() => "installing" as const),
+        done: (state) => state === "ready" || state === "failed",
+        intervalMs: 3000,
+        timeoutMs: 12 * 60 * 1000,
+        cancelled: () => !pageAlive.current,
+      });
+      if (r.status === "done" && r.value === "ready") {
+        popupOrOffer("ProxMate IDE is ready.");
+      } else if (r.status === "done") {
+        toast.error("The IDE install didn't finish. Check the VM and try again.");
+      } else if (r.status === "timeout") {
+        toast.error("The IDE install is taking unusually long — check the VM and try again.");
       }
     } catch (err) {
       // The backend tags CPU-guardrail refusals so we can offer the right remedy
@@ -233,29 +271,35 @@ export default function VmDetailPage() {
     try {
       const r = await api.post<{ target: string }>(`/ide/${vm.id}/relocate`, {});
       toast.info(`Moving ${vm.name} to a capable node (${r.data.target}) — it will shut down, move, and start again…`);
-      const deadline = Date.now() + 45 * 60 * 1000;
-      while (Date.now() < deadline) {
-        await new Promise((res) => setTimeout(res, 5000));
-        const st = await api
-          .get<{ state: "none" | "running" | "done" | "failed"; error?: string }>(`/ide/${vm.id}/relocate-status`)
-          .then((x) => x.data)
-          .catch(() => ({ state: "running" as const }));
-        if (st.state === "done") {
-          toast.success("Move complete — opening the IDE…");
-          await load();
-          await openIde();
-          return;
-        }
-        if (st.state === "failed") {
-          toast.error(st.error || "The move didn't finish. Check the VM and try again.");
-          return;
-        }
-        if (st.state === "none") {
-          toast.info("The move finished — open the IDE again.");
-          return;
-        }
+      const vmId = vm.id;
+      const poll = await pollUntil<{ state: "none" | "running" | "done" | "failed"; error?: string }>({
+        fetch: () =>
+          api
+            .get<{ state: "none" | "running" | "done" | "failed"; error?: string }>(`/ide/${vmId}/relocate-status`)
+            .then((x) => x.data)
+            .catch(() => ({ state: "running" as const })),
+        done: (st) => st.state !== "running",
+        intervalMs: 5000,
+        timeoutMs: 45 * 60 * 1000,
+        cancelled: () => !pageAlive.current,
+      });
+      if (poll.status === "cancelled") return;
+      if (poll.status === "timeout") {
+        toast.error("The move is taking unusually long — check the VM's status.");
+        return;
       }
-      toast.error("The move is taking unusually long — check the VM's status.");
+      const st = poll.value;
+      if (st.state === "done") {
+        toast.success("Move complete — opening the IDE…");
+        await load();
+        await openIde();
+        return;
+      }
+      if (st.state === "failed") {
+        toast.error(st.error || "The move didn't finish. Check the VM and try again.");
+        return;
+      }
+      toast.info("The move finished — open the IDE again.");
     } catch (err) {
       toast.error(apiError(err));
     } finally {
@@ -467,6 +511,9 @@ export default function VmDetailPage() {
   const busy = acting || ideBusy || deploying || (pending !== null && pending !== "delete-failed");
   const running = vm.status === "running";
   const stopped = vm.status === "stopped" || vm.status === "error";
+  // A held or errored machine can only be repaired or deleted: the backend refuses
+  // start, console and IDE, so those controls are disabled (and the banner says why).
+  const held = isVmHeld(vm);
   // Access: the API grants per-capability (share presets Viewer/Operator/Manager;
   // owner/admin hold everything) — the UI just hides what won't work.
   const caps = new Set(vm.caps ?? []);
@@ -530,6 +577,8 @@ export default function VmDetailPage() {
         </div>
       )}
 
+      <HoldBanner vm={vm} />
+
       {/* DigitalOcean-style header: identity + status on the left, the two things
           you reach for most — Console and Actions — pinned on the right. */}
       <div className="mb-6 flex flex-wrap items-start justify-between gap-4">
@@ -573,7 +622,7 @@ export default function VmDetailPage() {
             <DropdownMenu>
               <DropdownMenuTrigger
                 render={
-                  <Button variant="outline" disabled={!running || acting || ideBusy}>
+                  <Button variant="outline" disabled={!running || acting || ideBusy || held}>
                     <Terminal />
                     Console
                     <ChevronDown className="size-3.5 text-muted-foreground" />
@@ -589,9 +638,17 @@ export default function VmDetailPage() {
                   <SquareTerminal />
                   Text — links, copy/paste
                 </DropdownMenuItem>
-                {ideCap?.available && canIde && vm.type !== "lxc" && isDesktop && (
+                {/* The IDE opens only for the VM's owner (the server refuses
+                    admins and sharees), so say so instead of offering a dead end. */}
+                {ideCap?.available && canIde && vm.type !== "lxc" && isDesktop && vm.access !== "owner" && (
+                  <DropdownMenuItem disabled>
+                    <Code2 />
+                    ProxMate IDE — owner only
+                  </DropdownMenuItem>
+                )}
+                {ideCap?.available && canIde && vm.type !== "lxc" && isDesktop && vm.access === "owner" && (
                   <DropdownMenuItem
-                    disabled={!running || ideBusy}
+                    disabled={!running || ideBusy || held}
                     onClick={() => {
                       if (!isDesktop) return; // desktop-only feature (defense-in-depth)
                       openIde();
@@ -635,7 +692,7 @@ export default function VmDetailPage() {
               <DropdownMenuContent align="end" className="min-w-52">
                 {canPower && (
                 <DropdownMenuGroup>
-                  <DropdownMenuItem disabled={busy || running} onClick={() => action("start", "start")}>
+                  <DropdownMenuItem disabled={busy || running || held} onClick={() => action("start", "start")}>
                     <Play />
                     Start
                   </DropdownMenuItem>

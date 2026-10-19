@@ -6,6 +6,8 @@ import { isMailConfigured, sendMail } from './mail.service.js';
 import { alertEmail } from '../lib/email-templates.js';
 import { notifyWebhook } from './notify.service.js';
 import * as pve from './proxmox.service.js';
+import { envNumber } from '../lib/env-number.js';
+import { tagsMarkRow } from './vm.service.js';
 
 /**
  * Per-VM resource alerts. Tenants set thresholds on their own machines; the
@@ -26,8 +28,15 @@ export const ALERT_METRIC_LABEL: Record<AlertMetric, string> = {
   down: 'Unexpectedly stopped',
 };
 
+/**
+ * Rules one VM may carry. Every rule is evaluated each tick and each firing one
+ * is delivered, so this bounds the work and mail one machine can cause (the same
+ * reasoning as the SSH-key and snapshot caps).
+ */
+export const MAX_ALERT_RULES_PER_VM = 20;
+
 /** Don't re-fire the same rule more often than this (minutes). */
-const COOLDOWN_MIN = Math.max(5, Number(process.env['ALERT_COOLDOWN_MIN'] ?? 60));
+const COOLDOWN_MIN = envNumber('ALERT_COOLDOWN_MIN', 60, 5);
 
 /** One VM's live signals, as seen this tick. `diskPct` is null when unknown (no agent). */
 export interface VmSignals {
@@ -132,6 +141,7 @@ interface LiveResource {
   cpu?: number;
   mem?: number;
   maxmem?: number;
+  tags?: string;
 }
 
 /**
@@ -159,10 +169,15 @@ export async function evaluateAlerts(now: Date = new Date()): Promise<{ fired: n
   const diskCache = new Map<number, number | null>();
   const frontendUrl = (await getConfig('frontend_url')) ?? process.env['FRONTEND_URL'] ?? '';
   let fired = 0;
+  // Rules that fired this tick, grouped per VM so each machine produces one email
+  // and one webhook post however many of its rules tripped together.
+  const firedByVm = new Map<string, { vm: (typeof rules)[number]['vm']; items: Array<{ label: string; detail: string }> }>();
 
   for (const rule of rules) {
     const vm = rule.vm;
     const live = byVmid.get(vm.proxmoxVmId);
+    // A guest at this VMID that isn't the row's own says nothing about this machine.
+    if (live && !tagsMarkRow(live.tags, vm.id)) continue;
     const running = live?.status === 'running';
 
     let diskPct: number | null = null;
@@ -199,12 +214,19 @@ export async function evaluateAlerts(now: Date = new Date()): Promise<{ fired: n
       .catch(() => undefined);
     fired += 1;
 
-    const label = ALERT_METRIC_LABEL[rule.metric as AlertMetric];
-    const detail = describeAlert(rule, signals);
+    const entry = firedByVm.get(vm.id) ?? { vm, items: [] };
+    entry.items.push({ label: ALERT_METRIC_LABEL[rule.metric as AlertMetric], detail: describeAlert(rule, signals) });
+    firedByVm.set(vm.id, entry);
+  }
+
+  const mailOn = firedByVm.size > 0 && (await isMailConfigured());
+  for (const { vm, items } of firedByVm.values()) {
+    const label = [...new Set(items.map((i) => i.label))].join(', ');
+    const detail = items.map((i) => i.detail).join(' ');
     const vmUrl = frontendUrl ? `${frontendUrl.replace(/\/+$/, '')}/vms/${vm.id}` : undefined;
 
     // Email the owner (best-effort).
-    if (await isMailConfigured()) {
+    if (mailOn) {
       const owner = await prisma.user.findUnique({ where: { id: vm.userId }, select: { email: true } }).catch(() => null);
       if (owner?.email) {
         const { subject, text, html } = alertEmail({ vmName: vm.name, alertLabel: label, detail, vmUrl });

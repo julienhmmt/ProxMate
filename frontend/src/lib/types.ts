@@ -79,6 +79,12 @@ export interface VirtualMachine {
   storage: number;
   os: string;
   status: VmStatus;
+  /**
+   * Set while the machine may not run (a create, rebuild or restore that didn't
+   * finish, or a restore that left it over quota), with how to recover; null
+   * otherwise.
+   */
+  holdReason?: string | null;
   ipAddress: string | null;
   /** The guest's Tailscale (100.x) address, when Tailscale runs inside it. */
   tailscaleIp: string | null;
@@ -105,9 +111,10 @@ export interface VmDisk {
 
 export interface VmShare {
   id: string;
+  /** The address the owner shared with (the sharee's other account details are not exposed). */
+  email: string;
   role: "viewer" | "operator" | "manager";
   createdAt: string;
-  user: { id: string; email: string; displayName: string };
 }
 
 export interface VmLiveStatus {
@@ -133,6 +140,8 @@ export interface VmDetail extends VirtualMachine {
 /** GET /api/ide/:id/status */
 export interface IdeStatus {
   state: "none" | "installing" | "ready" | "failed";
+  /** A 'ready' install made before per-VM guest authentication; it must be reinstalled to open. */
+  reinstallRequired?: boolean;
 }
 
 /** One 1 s sample from GET /vms/:id/live-stats (cached cluster/resources). */
@@ -261,6 +270,8 @@ export interface InviteValidation {
   expiresAt: string;
   label: string | null;
   require2fa: boolean;
+  /** Set when the invite was sent to an address: registration must use it. */
+  email: string | null;
 }
 
 export interface ManagedUser {
@@ -401,9 +412,22 @@ export interface ResourceHistory {
   usage: UserUsage[];
 }
 
+/** Something a guest NIC can be attached to (Linux bridge, OVS bridge or SDN VNet). */
+export interface GuestNetwork {
+  name: string;
+  kind: "bridge" | "ovs" | "vnet";
+  /** SDN zone, for a VNet. */
+  zone?: string;
+  comment?: string;
+  /** Nodes it is known to exist on. */
+  nodes: string[];
+}
+
 export interface ProxmoxResources {
   storages: Array<{ name: string; type: string }>;
-  bridges: Array<{ name: string }>;
+  bridges: GuestNetwork[];
+  /** Online node count; a network on fewer nodes than this is flagged in the picker. */
+  nodeCount?: number;
   isoStorages: Array<{ name: string; type: string }>;
   backupStorages: Array<{ name: string; type: string }>;
 }
@@ -523,7 +547,10 @@ export type NotifyEvent =
   | "deploy.agent_missing";
 
 export interface NotifyConfig {
-  webhookUrl: string;
+  /** The URL itself is never returned (it carries the receiver's token). */
+  hasWebhookUrl: boolean;
+  /** Scheme and host only, e.g. "https://discord.com/…"; '' when unset. */
+  webhookUrlMasked: string;
   emailEnabled: boolean;
   emailTo: string;
   events: NotifyEvent[];

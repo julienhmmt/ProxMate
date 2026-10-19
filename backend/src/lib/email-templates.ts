@@ -30,6 +30,8 @@ export interface RenderedEmail {
  * Wrap inner table rows in ProxMate's branded, email-client-safe shell: table
  * layout + inline styles (for Outlook/Gmail), a fixed light palette matching the
  * app's monochrome theme, a hidden preheader, and a wordmark header + footer.
+ * `preheader` is plain text and is escaped here: callers pass user-supplied names
+ * and addresses into it, and it is markup like the body.
  */
 function wrapEmail(preheader: string, bodyRows: string): string {
   return `<!DOCTYPE html>
@@ -42,7 +44,7 @@ function wrapEmail(preheader: string, bodyRows: string): string {
 <title>ProxMate</title>
 </head>
 <body style="margin:0; padding:0; background-color:#f4f4f5;">
-<div style="display:none; max-height:0; overflow:hidden; opacity:0; mso-hide:all;">${preheader}</div>
+<div style="display:none; max-height:0; overflow:hidden; opacity:0; mso-hide:all;">${escapeHtml(preheader)}</div>
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background-color:#f4f4f5;">
 <tr>
 <td align="center" style="padding:32px 16px;">
@@ -326,6 +328,26 @@ export function announcementEmail(subject: string, message: string, unsubscribeU
  * a running guest keeps running with at most a momentary blip; a stopped guest
  * has no extra interruption.
  */
+/**
+ * Tells a VM's owner that a rebuild failed after the old disk was wiped. `kept` is
+ * whether the machine is still listed (in an error state, so it can be restored
+ * from a backup or deleted) or was removed because nothing was left of it.
+ */
+export function vmRebuildFailedEmail(opts: { vmName: string; kept: boolean; reason: string }): RenderedEmail {
+  const { vmName, kept, reason } = opts;
+  const subject = `[ProxMate] Rebuild of "${vmName}" failed`;
+  const next = kept
+    ? 'The machine is still listed in an error state. Its backups are kept, and one can be restored while the VM slot is ' +
+      'empty — or you can delete the machine.'
+    : 'The old disk had already been wiped and nothing was created in its place, so the machine has been removed from your list.';
+  const text = `Rebuilding your VM "${vmName}" failed: ${reason}\n\n${next}`;
+  const bodyRows =
+    h1('A rebuild failed') +
+    p(`Rebuilding your VM <strong style="color:${INK};">${escapeHtml(vmName)}</strong> failed: ${escapeHtml(reason)}`) +
+    p(next, { color: MUTED, size: 13, mb: 0 });
+  return { subject, text, html: wrapEmail(`Rebuild of "${vmName}" failed.`, bodyRows) };
+}
+
 export function vmMaintenanceEmail(opts: { vmName: string; live: boolean }): RenderedEmail {
   const { vmName, live } = opts;
   const subject = `[ProxMate] Maintenance: your server "${vmName}" is being moved`;
@@ -354,7 +376,7 @@ export function vmMaintenanceEmail(opts: { vmName: string; live: boolean }): Ren
   return {
     subject,
     text,
-    html: wrapEmail(`Maintenance: your server "${escapeHtml(vmName)}" is being moved to another host.`, bodyRows),
+    html: wrapEmail(`Maintenance: your server "${vmName}" is being moved to another host.`, bodyRows),
   };
 }
 
@@ -389,7 +411,7 @@ export function alertEmail(opts: { vmName: string; alertLabel: string; detail: s
       mb: 0,
     });
 
-  return { subject, text, html: wrapEmail(`${alertLabel}: ${escapeHtml(vmName)}`, bodyRows) };
+  return { subject, text, html: wrapEmail(`${alertLabel}: ${vmName}`, bodyRows) };
 }
 
 /**

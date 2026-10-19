@@ -14,6 +14,7 @@ import type {
   PciMapping,
 } from "@/lib/types";
 import { formatRam, formatDate, formatBytes, formatUptime } from "@/lib/format";
+import { ramGbField, ramMbToSave } from "@/lib/quota";
 import { PageHeader } from "@/components/dashboard/page-header";
 import { UsageReport } from "@/components/admin/usage-report";
 import { FormField } from "@/components/form-field";
@@ -477,7 +478,7 @@ const ACCESS_OPTIONS = [
 function EditQuotaDialog({ user, onDone }: { user: ManagedUser; onDone: () => void }) {
   const [open, setOpen] = useState(false);
   const [cpu, setCpu] = useState(user.quota.cpu.max);
-  const [ramGb, setRamGb] = useState(Math.round(user.quota.ram.max / 1024));
+  const [ramGb, setRamGb] = useState(ramGbField(user.quota.ram.max));
   const [storage, setStorage] = useState(user.quota.storage.max);
   // "keep" = don't touch the window at all, so a quota edit never silently
   // resets someone's expiry. Any other value re-anchors it from today.
@@ -491,7 +492,7 @@ function EditQuotaDialog({ user, onDone }: { user: ManagedUser; onDone: () => vo
     setOpen(o);
     if (o) {
       setCpu(user.quota.cpu.max);
-      setRamGb(Math.round(user.quota.ram.max / 1024));
+      setRamGb(ramGbField(user.quota.ram.max));
       setStorage(user.quota.storage.max);
       setAccess("keep"); // the dialog never unmounts — re-seed on every open
     }
@@ -502,7 +503,7 @@ function EditQuotaDialog({ user, onDone }: { user: ManagedUser; onDone: () => vo
     try {
       await api.patch(`/users/${user.id}`, {
         maxCpu: cpu,
-        maxRam: ramGb * 1024,
+        maxRam: ramMbToSave(user.quota.ram.max, ramGb),
         maxStorage: storage,
         ...(access !== "keep" && { accessDuration: access }),
       });
@@ -603,6 +604,7 @@ function EditQuotaDialog({ user, onDone }: { user: ManagedUser; onDone: () => vo
 function ResetPasswordButton({ user, onDone }: { user: ManagedUser; onDone: () => void }) {
   const [open, setOpen] = useState(false);
   const [pw, setPw] = useState("");
+  const [removePasskeys, setRemovePasskeys] = useState(false);
   const [busy, setBusy] = useState(false);
 
   function generate() {
@@ -641,10 +643,11 @@ function ResetPasswordButton({ user, onDone }: { user: ManagedUser; onDone: () =
     }
     setBusy(true);
     try {
-      await api.post(`/admin/users/${user.id}/reset-password`, { password: pw });
+      await api.post(`/admin/users/${user.id}/reset-password`, { password: pw, removePasskeys });
       toast.success(`Password reset for ${user.email}. Share it with them securely.`);
       setOpen(false);
       setPw("");
+      setRemovePasskeys(false);
       onDone();
     } catch (err) {
       toast.error(apiError(err));
@@ -674,6 +677,15 @@ function ResetPasswordButton({ user, onDone }: { user: ManagedUser; onDone: () =
           <button type="button" onClick={generate} className="text-left text-xs text-primary hover:underline">
             Generate a random password
           </button>
+          <label className="flex items-center gap-2 text-sm select-none">
+            <input
+              type="checkbox"
+              checked={removePasskeys}
+              onChange={(e) => setRemovePasskeys(e.target.checked)}
+              className="size-4 rounded border-input accent-primary"
+            />
+            Also remove their passkeys
+          </label>
         </div>
         <AlertDialogFooter>
           <AlertDialogCancel disabled={busy}>Cancel</AlertDialogCancel>
