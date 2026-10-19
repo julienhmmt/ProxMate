@@ -14,11 +14,6 @@ This file leads with **what's still open**, then **new ideas**, then a condensed
 
 ### Still open from v1.0.0 verification
 
-- **Expired-access API tokens return the wrong status.** A `pm_…` token whose account's compute
-  access window has lapsed gets a generic `401`, not the `403 access_expired` the session paths
-  return — API callers can't distinguish "bad token" from "access lapsed."
-- **Access-expiry sweep has no test coverage.** `suspendLapsed` and the graceful→force stop
-  escalation are untested, which blocks refactoring the scheduler with confidence.
 - **A genuine least-privilege Proxmox role.** Document (and ideally automate) a scoped token instead
   of `root@pam`. Prior investigation suggests the earlier pool-scoping failure was an ACL naming
   `users=` where a privilege-separated token needs `tokens=`; needs a working recipe incl. `VM.Audit`.
@@ -37,9 +32,6 @@ This file leads with **what's still open**, then **new ideas**, then a condensed
   is SQLite-locked (`migration_lock.toml`), and the built-in app-DB backup uses SQLite's
   `VACUUM INTO`. Postgres today means `db push` + `pg_dump`; proper support wants a migration
   history and a backup path of its own. SQLite stays the default.
-- **Forward the remaining tuning vars in Docker Compose.** `ALERT_COOLDOWN_MIN` and
-  `PUBLIC_TOKEN_RATE_LIMIT_*` are read by the backend but not passed through by the shipped
-  `docker-compose.yml`, so setting them in `.env` silently does nothing under Compose.
 
 ### Production hardening & ops
 
@@ -124,6 +116,10 @@ Fresh proposals; none built yet. Each stays inside the API-only + tenant-isolati
 
 Full detail + dates in [`completed-tasks.md`](completed-tasks.md).
 
+- **v1.1.1 — follow-up.** Personal API tokens of an account whose access window has ended answer
+  `403 access_expired`; Compose forwards `ALERT_COOLDOWN_MIN` and the public-token rate-limit
+  settings; non-numeric `PORT` / `RESTORE_UPLOAD_MAX_GB` fall back to defaults; the access-expiry
+  sweep is covered by tests.
 - **v1.1.0 (2026-10-19) — security and reliability release.** A full code review, every finding closed:
   **guest ownership tags** gate every guest action (existing guests tagged on upgrade, admin
   **Unconfirmed machines** card for the rest); **owner-only IDE** with per-machine guest proof;
