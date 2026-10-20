@@ -1124,6 +1124,22 @@ async function snippetFor(
 }
 
 /**
+ * The optional cloud-init extras a deploy asked for that the admin actually OFFERS:
+ * the `features` id array (data-driven) plus the legacy install* booleans
+ * (back-compat). Never arbitrary tenant input, never a de-offered feature.
+ */
+async function selectedFeatureIds(cloud: CloudInitInput): Promise<Set<string>> {
+  const offered = new Set(await getOfferedFeatureIds());
+  const selected = new Set<string>();
+  for (const id of cloud.features ?? []) if (offered.has(id)) selected.add(id);
+  if (cloud.installDocker && offered.has('docker')) selected.add('docker');
+  if (cloud.installTailscale && offered.has('tailscale')) selected.add('tailscale');
+  if (cloud.installGuestAgent && offered.has('guest-agent')) selected.add('guest-agent');
+  if (cloud.installSuperfile && offered.has('superfile')) selected.add('superfile');
+  return selected;
+}
+
+/**
  * Configure a freshly-cloned VM in place: autoscale cores/memory, grow the primary
  * disk if needed, inject cloud-init (login user + SSH key + DHCP, optional first-boot
  * extras), and apply tenant firewall isolation. Shared by deployFromTemplate and
@@ -1159,13 +1175,7 @@ async function configureClonedVm(
     // Selected optional extras: prefer the `features` id array (data-driven), still
     // honor the legacy install* booleans (back-compat). Only ids the admin actually
     // OFFERS are accepted — never arbitrary tenant input, never a de-offered feature.
-    const offered = new Set(await getOfferedFeatureIds());
-    const selected = new Set<string>();
-    for (const id of cloud.features ?? []) if (offered.has(id)) selected.add(id);
-    if (cloud.installDocker && offered.has('docker')) selected.add('docker');
-    if (cloud.installTailscale && offered.has('tailscale')) selected.add('tailscale');
-    if (cloud.installGuestAgent && offered.has('guest-agent')) selected.add('guest-agent');
-    if (cloud.installSuperfile && offered.has('superfile')) selected.add('superfile');
+    const selected = await selectedFeatureIds(cloud);
 
     // The admin-configured always-on base rides on EVERY cloud-init VM — but only
     // when on-demand snippet writing is set up, since that's what makes a mandatory
@@ -1310,11 +1320,19 @@ async function planTemplateClone(
  * respects the disk pool.
  */
 async function snippetCapableNodes(
+  template: Template,
+  cloud: CloudInitInput,
   client: Awaited<ReturnType<typeof pve.getClient>>,
 ): Promise<string[] | undefined> {
-  const storage = process.env['SNIPPET_STORAGE'] ?? (await getConfig('iso_storage')) ?? undefined;
-  if (!storage) return undefined;
-  return (await pve.storageNodes(storage, client)) ?? undefined;
+  if (!template.cloudInit) return undefined; // only cloud-init deploys get a vendor snippet
+  const onDemand = pve.snippetWriteConfig();
+  if (onDemand) return (await pve.storageNodes(onDemand.storage, client)) ?? undefined;
+  // Hand-placed snippets: a deploy that asked for extras needs the node that already
+  // holds that exact file (see snippetFor); one that asked for none needs no snippet.
+  const ids = [...(await selectedFeatureIds(cloud))];
+  if (ids.length === 0) return undefined;
+  const storage = (await getConfig('iso_storage')) ?? 'local';
+  return pve.nodesWithSnippet(storage, pve.cloudInitSnippetFile(ids), client);
 }
 
 /**
@@ -1332,6 +1350,7 @@ async function pickTemplateDeployNode(
   template: Template,
   plan: { full: boolean; storage?: string },
   want: { cpu: number; ramMb: number; storageGb: number },
+  cloud: CloudInitInput,
   client: Awaited<ReturnType<typeof pve.getClient>>,
 ): Promise<string> {
   const home = template.proxmoxNode;
@@ -1348,7 +1367,7 @@ async function pickTemplateDeployNode(
       return home;
     }
     const arch = template.arch === 'amd64' || template.arch === 'arm64' ? template.arch : undefined;
-    return await pve.pickBestNode(want, dest, client, await snippetCapableNodes(client), arch);
+    return await pve.pickBestNode(want, dest, client, await snippetCapableNodes(template, cloud, client), arch);
   } catch (err) {
     console.warn(
       `[vm] could not place a deploy of template ${template.proxmoxVmId} across the cluster ` +
@@ -1407,6 +1426,7 @@ async function deployFromTemplateLocked(
     template,
     plan,
     { cpu: input.cpu, ramMb: input.ram, storageGb: diskGb },
+    input,
     client,
   );
   const vmid = await pve.getNextVmId(client);
@@ -2730,7 +2750,13 @@ export async function assertOwnerAccessActive(vm: VirtualMachine): Promise<void>
 export async function startVm(vm: VirtualMachine): Promise<void> {
   await assertOwnerAccessActive(vm);
   const currentVm = await requireOurGuest(vm);
-  await pve.startVm(currentVm.proxmoxNode, currentVm.proxmoxVmId, undefined, kindOf(currentVm));
+  const upid = await pve.startVm(currentVm.proxmoxNode, currentVm.proxmoxVmId, undefined, kindOf(currentVm));
+  // Same reasoning as stopVm: only a task that finished OK means the guest is up.
+  await awaitPowerTask(
+    currentVm.proxmoxNode,
+    upid,
+    'The guest is still starting — check again in a moment.',
+  );
   await prisma.virtualMachine.update({ where: { id: currentVm.id }, data: { status: 'running' } });
 }
 
@@ -2751,7 +2777,23 @@ export async function startVm(vm: VirtualMachine): Promise<void> {
  * not gone down by then is the very case this function exists to report, so say so
  * instead of waiting on it.
  */
-const STOP_TASK_TIMEOUT_MS = 45_000;
+const POWER_TASK_TIMEOUT_MS = 45_000;
+
+/**
+ * Wait for a power task and let its exit status decide. A task Proxmox reports as
+ * failed throws its own message. Running past our deadline is not a Proxmox refusal
+ * — the task may yet finish — so it throws `onTimeout`, something the user can act
+ * on, rather than "Proxmox task timed out"; the caller writes nothing either way and
+ * the reconciler records whatever actually happens.
+ */
+async function awaitPowerTask(node: string, upid: string, onTimeout: string | null): Promise<void> {
+  try {
+    await pve.waitForTask(node, upid, undefined, POWER_TASK_TIMEOUT_MS);
+  } catch (err) {
+    if (onTimeout && /task timed out/i.test(pve.pveMessage(err))) throw new Error(onTimeout);
+    throw err;
+  }
+}
 
 export async function stopVm(vm: VirtualMachine, force: boolean): Promise<void> {
   const currentVm = await requireOurGuest(vm, { allowError: true });
@@ -2759,20 +2801,14 @@ export async function stopVm(vm: VirtualMachine, force: boolean): Promise<void> 
   const upid = force
     ? await pve.stopVm(currentVm.proxmoxNode, currentVm.proxmoxVmId, undefined, kind)
     : await pve.shutdownVm(currentVm.proxmoxNode, currentVm.proxmoxVmId, undefined, kind);
-  try {
-    await pve.waitForTask(currentVm.proxmoxNode, upid, undefined, STOP_TASK_TIMEOUT_MS);
-  } catch (err) {
-    // Our own deadline, not a Proxmox refusal: the task may yet finish, so leave the
-    // row alone (the reconciler records whatever actually happens) and tell the user
-    // something they can act on rather than "Proxmox task timed out".
-    if (!force && /task timed out/i.test(pve.pveMessage(err))) {
-      throw new Error(
-        'The guest has not shut down yet — it may be ignoring the shutdown request. ' +
+  await awaitPowerTask(
+    currentVm.proxmoxNode,
+    upid,
+    force
+      ? null
+      : 'The guest has not shut down yet — it may be ignoring the shutdown request. ' +
           'Give it a moment, or stop it forcibly.',
-      );
-    }
-    throw err;
-  }
+  );
   if (!isHeld(currentVm)) {
     await prisma.virtualMachine.update({ where: { id: currentVm.id }, data: { status: 'stopped' } });
   }
@@ -2781,7 +2817,15 @@ export async function stopVm(vm: VirtualMachine, force: boolean): Promise<void> 
 export async function restartVm(vm: VirtualMachine): Promise<void> {
   await assertOwnerAccessActive(vm); // same owner-window guard as startVm
   const currentVm = await requireOurGuest(vm);
-  await pve.rebootVm(currentVm.proxmoxNode, currentVm.proxmoxVmId, undefined, kindOf(currentVm));
+  const upid = await pve.rebootVm(currentVm.proxmoxNode, currentVm.proxmoxVmId, undefined, kindOf(currentVm));
+  // A reboot is a graceful shutdown then a start, so a guest that ignores ACPI hangs
+  // it exactly as it hangs a shutdown.
+  await awaitPowerTask(
+    currentVm.proxmoxNode,
+    upid,
+    'The guest has not restarted yet — it may be ignoring the shutdown request. ' +
+      'Give it a moment, or stop it forcibly and start it again.',
+  );
   await prisma.virtualMachine.update({ where: { id: currentVm.id }, data: { status: 'running' } });
 }
 
