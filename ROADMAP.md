@@ -14,17 +14,13 @@ This file leads with **what's still open**, then **new ideas**, then a condensed
 
 ### Still open from v1.0.0 verification
 
-- **A genuine least-privilege Proxmox role.** Document (and ideally automate) a scoped token instead
-  of `root@pam`. Prior investigation suggests the earlier pool-scoping failure was an ACL naming
-  `users=` where a privilege-separated token needs `tokens=`; needs a working recipe incl. `VM.Audit`.
+- **Verify the least-privilege token on a live cluster.** `deploy/proxmox-token.sh` and the
+  connection test now cover every privilege ProxMate's code uses. Still to confirm on real Proxmox
+  VE 8 and 9 nodes: the PVE 9 guest-agent privileges for password apply and command exec, whether
+  `cicustom` snippets need `Datastore.Allocate`, the `download-url` check, and non-root restores.
 
 ### Placement & reliability
 
-- **Template deploys ignore the scheduler — spread full clones across nodes.** `deployFromTemplate`
-  clones onto whichever node holds the template; `pickBestNode` is never consulted on this path, so
-  template deploys pile onto one node. When the clone is full (cloud-init templates) and both the
-  base disk and `default_storage` are shared, pick a node and pass `target`. Linked clones must stay
-  with their base volume and are exempt.
 - **Background reconciler for Proxmox tasks.** Async UPIDs are reconciled opportunistically on read;
   a backend restart mid-operation can leave rows stuck in `creating`/`restoring`. A worker that polls
   tasks to completion and sweeps stuck rows at startup would make state authoritative.

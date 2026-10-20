@@ -1432,7 +1432,16 @@ export async function convertToTemplate(node: string, vmid: number, client?: Axi
 
 /** Clone a template into a new VM. Returns the Proxmox task UPID. */
 export async function cloneVm(
-  opts: { node: string; templateVmid: number; newVmid: number; name: string; full?: boolean; storage?: string },
+  opts: {
+    node: string;
+    templateVmid: number;
+    newVmid: number;
+    name: string;
+    full?: boolean;
+    storage?: string;
+    /** Node the clone lands on, when not the source's. Proxmox allows it only for shared storage. */
+    target?: string;
+  },
   client?: AxiosInstance,
 ): Promise<string> {
   const c = client ?? (await getClient());
@@ -1442,6 +1451,7 @@ export async function cloneVm(
     full: opts.full ? '1' : '0',
   });
   if (opts.full && opts.storage) params.set('storage', opts.storage);
+  if (opts.target && opts.target !== opts.node) params.set('target', opts.target);
   const res = await c.post<{ data: string }>(
     `/nodes/${opts.node}/qemu/${opts.templateVmid}/clone`,
     params,
@@ -2166,6 +2176,21 @@ export function diskStorageOf(config: Record<string, string>): string | null {
 }
 
 /**
+ * Every storage a guest's drives live on (`tank` and `ceph-vm` for
+ * `scsi0: tank:…` + `ide2: ceph-vm:vm-104-cloudinit,media=cdrom`), deduplicated.
+ * Drives with no volume (`none`, a bare `cdrom`) are skipped.
+ */
+export function volumeStoragesOf(config: Record<string, string>): string[] {
+  const out = new Set<string>();
+  for (const [key, value] of Object.entries(config)) {
+    if (!VOLUME_KEY_RE.test(key)) continue;
+    const m = /^([^:,\s]+):/.exec(value);
+    if (m) out.add(m[1]!);
+  }
+  return [...out];
+}
+
+/**
  * Whether `storage` is enabled, active and image-capable on `node`.
  *
  * Checked before redirecting a clone onto the admin's default pool: a clone runs on
@@ -2185,6 +2210,34 @@ export async function storageAvailableOn(
     return list.some((s) => s.storage === storage);
   } catch {
     return true;
+  }
+}
+
+/**
+ * The nodes a storage is actually available on, or null when that can't be told —
+ * callers then fail open rather than refusing to place a guest.
+ *
+ * Read from `/cluster/resources`, not `/storage/<id>`: the storage *configuration*
+ * endpoint needs `Datastore.Allocate` (a least-privilege token without it gets
+ * `Permission check failed (/storage/<id>, Datastore.Allocate)`), while the resource
+ * list needs only `Datastore.Audit`, which ProxMate already treats as mandatory. It
+ * also reports real per-node availability rather than just the configured `nodes`
+ * restriction.
+ */
+export async function storageNodes(storage: string, client?: AxiosInstance): Promise<string[] | null> {
+  const c = client ?? (await getClient());
+  try {
+    const res = await c.get<{ data: ClusterResource[] }>('/cluster/resources', { params: { type: 'storage' } });
+    const nodes = [
+      ...new Set(
+        res.data.data
+          .filter((s) => s.storage === storage && s.node && (!s.status || s.status === 'available'))
+          .map((s) => s.node!),
+      ),
+    ];
+    return nodes.length > 0 ? nodes : null;
+  } catch {
+    return null;
   }
 }
 

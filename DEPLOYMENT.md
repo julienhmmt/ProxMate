@@ -87,6 +87,19 @@ pveum user token add root@pam proxmate --privsep 0       # privsep OFF
 You'll enter `root@pam!proxmate` as the **Token ID** and that value as the **Secret**
 during OOBE (§7).
 
+**Least-privilege alternative (recommended).** `deploy/proxmox-token.sh`, run as root on one
+node, creates the user `proxmate@pve`, a role holding only the privileges ProxMate uses, and a
+privilege-separated token, granting the role on `/` to both:
+
+```bash
+bash proxmox-token.sh --dry-run                 # prints the pveum commands, changes nothing
+bash proxmox-token.sh --with-ide                # add --with-passthrough if you use PCI mappings
+```
+
+The connection test then reports every privilege that is still missing; a correctly created
+token passes it with no warnings. `Datastore.Audit` and `VM.Audit` are the two that block
+outright — without them ProxMate can see no guests and no storages.
+
 Whatever token you use must be able to set guest tags (`VM.Config.Options`): ProxMate
 tags every guest it manages with the machine it belongs to, and acts only on guests
 carrying their own machine's tag. On Proxmox VE 8+ it also needs `SDN.Use` (checked
@@ -94,9 +107,23 @@ whenever a guest NIC is attached, plain bridges included) and `SDN.Audit` to lis
 VNets; the connection test warns when either is missing. A privsep-off token has all
 of these.
 
-> Prefer least privilege? You can scope a token with a role on a pool instead — but
-> note the per-tenant Pool/ACL least-privilege model is still being validated
-> (tracked separately). For now a privsep-off token is the supported path.
+**Least privilege.** Instead of a root token, `deploy/proxmox-token.sh` creates a
+dedicated `proxmate@pve` user, a `ProxMate` role holding only the privileges ProxMate
+uses, and a privilege-separated token `proxmate@pve!proxmate` with the role granted on
+`/` to both the user and the token. Copy the script to a Proxmox node, read it, then:
+
+```bash
+bash proxmox-token.sh --dry-run     # show the pveum commands without running them
+bash proxmox-token.sh               # as root; prints the token secret once
+#   --with-ide          Proxmox VE 9: also allow the IDE's guest-agent file writes
+#   --with-passthrough  also allow GPU/PCI passthrough through resource mappings
+```
+
+It picks the guest-agent privileges for your release (`VM.Monitor` on Proxmox VE 8,
+`VM.GuestAgent.Audit` + `VM.GuestAgent.Unrestricted` on 9). Re-running it updates the
+role and ACLs and never re-issues an existing token. The connection test names any
+privilege that is still missing. The grant has to be on `/`: the cluster firewall,
+cluster status and cloud-image downloads are checked there.
 
 ---
 
