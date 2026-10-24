@@ -24,6 +24,12 @@ sources:
   - id: roadmap
     resource: https://github.com/r0073d-l053r/ProxMate/blob/main/ROADMAP.md
     title: ROADMAP.md
+  - id: pool
+    resource: https://github.com/r0073d-l053r/ProxMate/blob/main/backend/src/services/guest-pool.service.ts
+    title: backend/src/services/guest-pool.service.ts
+  - id: script
+    resource: https://github.com/r0073d-l053r/ProxMate/blob/main/deploy/proxmox-token.sh
+    title: deploy/proxmox-token.sh
 ---
 
 # Purpose
@@ -53,7 +59,10 @@ admin "test connection" action ([setup API](/api/setup.md), [admin API](/api/adm
    path holding nothing looks identical to no grant).[^setup]
 6. **Operational** privileges: missing ones become non-blocking `warnings` in the result
    (`{connected, version, nodeCount, vmCount, storageCount, warnings}`).[^setup]
-7. Blocking failures throw one error listing each item plus the hint to run
+7. With `proxmox_pool` set, the pool checks run next (see "Pool-scoped token" below); a pool
+   that does not exist is blocking, everything else a warning. With no pool set, a token whose
+   `VM.Allocate` exists only on some `/pool/<id>` gets a warning naming the pool to configure.[^pool]
+8. Blocking failures throw one error listing each item plus the hint to run
    `pveum user token permissions <userid> <tokenid>`.[^setup]
 
 # Schema
@@ -79,7 +88,7 @@ admin "test connection" action ([setup API](/api/setup.md), [admin API](/api/adm
 | `Datastore.AllocateSpace` | Warning | creating disks on a storage |
 | `Datastore.Allocate` | Warning | enabling snippets and cleaning up imported cloud images |
 | `Datastore.AllocateTemplate` | Warning | importing cloud images for the Template Store |
-| `Sys.Audit` | Warning | node health and capacity readings; also warned when `/nodes` returns no nodes |
+| `Sys.Audit` | Warning | node health and capacity readings; also warned when `/nodes` returns no nodes. Also needed on every `/nodes/<node>` for the restart reconciler to ever act on a finished late upload restore: without it the reconciler always holds such a row and writes nothing to its guest |
 | `Sys.Modify` | Warning | enforcing isolation on the cluster firewall |
 | `VM.Monitor` | Warning, only when the PVE major version is 8 or lower | the guest agent (guest IPs, login passwords, cloud-init progress) |
 | `VM.GuestAgent.Audit` / `VM.GuestAgent.Unrestricted` | Warning, only on PVE 9 or later | reading guest IPs; applying a deploy's login password and checking cloud-init progress |
@@ -116,6 +125,116 @@ retrying the call. Everything below is an observation from that cluster, not a r
 | Restore as a non-root token | A QEMU `vma.zst` archive is **neither refused nor silently changed**: cores, memory, disk size, `net0 … firewall=1` and the ownership tag all survived in place. No `SDN.Use` complaint for the archive's NIC (`vmbr0` is in the implicit `localnetwork` zone and the role holds `SDN.Use`). |
 | The token's own task calls | `GET /nodes/{n}/tasks`, `…/{upid}/status`, `…/{upid}/log` and `DELETE …/{upid}` all work with no extra privileges. |
 
+# Pool-scoped token (optional)
+
+`deploy/proxmox-token.sh --pool <name>` grants the guest privileges on a resource pool instead of
+on `/`, so Proxmox refuses the token guests outside the pool, and ProxMate (with the same pool in
+`proxmox_pool`) creates every guest inside it.[^script][^pool] The split follows the path Proxmox
+checks each privilege on:
+
+| Path | Propagate | Role | Privileges | What needs it there |
+|---|---|---|---|---|
+| `/pool/<name>` | yes | `ProxMate-Guest` | every `VM.*` the role holds (incl. the release's guest-agent ones), `Pool.Audit`, `Pool.Allocate` | Guests are checked on `/vms/<vmid>`, which a pool member inherits from `/pool/<name>`. Creating with `pool=<name>` needs `VM.Allocate` on the pool instead of on `/vms/<new id>` (create, clone, restore); a container create into the pool also checks `Pool.Allocate`. `Pool.Audit` lets the connection test see the pool; `Pool.Allocate` lets the move action add guests (Proxmox also checks `VM.Allocate` on each). |
+| `/nodes` | yes | `ProxMate-Infra` | `Sys.Audit`, and `Sys.AccessNetwork` on 8.2+ | Node status, RRD and capacity, `/cluster/resources` node rows, network and PCI listings, other users' tasks; `download-url` accepts `Sys.AccessNetwork` on the node instead of `Sys.Modify` on `/`. Not `Sys.Modify`, which on a node allows changing its configuration. |
+| `/storage` | yes | `ProxMate-Infra` | `Datastore.Audit`, `.AllocateSpace`, `.AllocateTemplate` | Disk allocation, ISO/template/snippet/import volume access, `download-url`'s storage half. |
+| `/storage/<id>`, only for a storage named with `--snippet-storage` or `--import-storage` (none by default) | yes | `ProxMate-Storage` | the three above plus `Datastore.Allocate` | `PUT /storage/<id>` to switch the snippets content type on, and deleting a downloaded cloud image after import. Neither is needed to run: root can enable snippets once, and an undeleted image just stays under `import/`. A more specific ACL replaces what `/storage` passes down, hence the full set. |
+| `/sdn/zones` | yes | `ProxMate-Infra` | `SDN.Audit`, `SDN.Use` | `SDN.Use` on `/sdn/zones/<zone>/<bridge>` for every NIC (plain bridges are in `localnetwork`); `SDN.Audit` for VNet and zone listings. |
+| `/mapping` | yes, only with `--with-passthrough` | `ProxMate-Infra` | `Mapping.Audit`, `Mapping.Use` | `/mapping/pci/<id>` for GPU/PCI passthrough. |
+| `/` | **no** (this path only) | `ProxMate-Cluster` | `Sys.Audit`; `Sys.Modify` only with `--with-cluster-firewall` (or before 8.2) | `Sys.Audit`: `/cluster/status` and the cluster firewall reads. `Sys.Modify`: enabling the cluster firewall and writing ProxMate's management rules; before 8.2 also `download-url`. |
+
+What still reaches past the pool, and is therefore opt-in or narrowed:
+
+- **`Sys.Modify` on `/`** also allows cluster backup jobs (`/cluster/backup`, which run as root and
+  can back up every guest), the cluster firewall's groups, IP sets and aliases, `/cluster/options`
+  and other cluster settings. While the token holds it, the pool does not fully contain it; the
+  script and the connection test both say so. Without it, enable the cluster firewall once by hand
+  as root (Datacenter → Firewall: an accept rule for the management network on 8006 and 22, then
+  enable); the connection test warns until then.
+- **`Datastore.Allocate`** deletes any volume and edits the storage definition, so it is not granted
+  unless a storage is named, and the script warns when a named storage also holds images,
+  container volumes or backups. Granting it on all of `/storage` draws a connection-test warning.
+  Re-running the script removes `ProxMate-*` grants left on paths that are no longer in the plan.
+
+What changes with a pool-scoped token:
+
+- Guests outside the pool disappear from `/cluster/resources`, so ProxMate stops seeing them: their
+  rows read as unconfirmed (every action fails closed), the Cluster Balancer, alerts and live stats
+  only see pool guests, and "Import existing guests" only lists guests already in the pool.
+  Admin-registered templates must be in the pool to be cloned (`VM.Clone` is checked on the template).
+- Imported guests are added to the pool. An in-place backup restore sends no `pool` (the guest keeps
+  its membership).
+- **Uploaded backups**: Proxmox treats a backup as owned by the VMID in its file name, and outside
+  the pool the token has no `VM.Backup` on that VMID. ProxMate therefore reserves the new VMID and
+  hard-links the archive on the share to `vzdump-<kind>-<new vmid>-…` (never replacing a file)
+  before Proxmox sees it, so the restore task reads an archive of the guest being restored. The
+  two reads before that — is the archive there, and what config does it carry — Proxmox would only
+  answer with `Datastore.Allocate` on the whole backup storage (they have no guest to compare the
+  VMID to), so in pool mode ProxMate does them itself: a stat on the share, the nodes where the
+  (shared) backup storage is available, and the guest config read from the archive
+  (`lib/vzdump-archive.ts`). That read is strict — the VMA header's blobs cut at the first NUL,
+  only `qemu-server.conf`/`qemu-server.fw`, no duplicates or out-of-range pointers; a container tar
+  must start with a checksummed regular-file header named exactly `./etc/vzdump/pct.conf` — and
+  capped at 4 MiB decompressed (zstd window capped too), and it is only an estimate for the quota
+  check and early refusals.
+- **What Proxmox restored is what counts.** A container restore applies the `etc/vzdump/pct.conf`
+  it finds in the extracted rootfs (the last one wins), so no archive pre-check can be
+  authoritative. Right after the restore task — in both modes, and before the guest is tagged,
+  re-networked or started — ProxMate reads the guest's config, its pending changes and its
+  snapshots back from Proxmox and applies the same allowlist; a read failure counts as a failure.
+  A guest that fails first loses `protection`, `onboot` and `startup` (so Proxmox can delete it and
+  will not start it on its own), then is deleted — the task that created it finished at a VMID only
+  it could have created, without `force`. If the delete is still refused, every refused key the API
+  can remove goes, pending changes are reverted, every NIC gets `link_down=1`, and the row is held;
+  the tenant is told the backup contains settings ProxMate won't restore. `onboot`, `startup` and
+  `protection` are removed right after the restore task, before the check, on every restore path.
+  The late-task follower runs the same check (and removal) once the task finishes OK, whether or
+  not the row is still there, and drops the row when the guest is removed. While it follows, the
+  held row keeps its op fields; if the follower is lost (a restart, its 6 h limit, a poll error),
+  the restart reconciler resumes following a task still running, or runs the same strip, check and
+  removal once the task has finished OK, but only when every node's task list shows nothing else
+  used the VMID since. That proof needs `Sys.Audit` on every `/nodes/<node>` (checked first, per
+  node, from `/access/permissions?path=/nodes/<node>`, so a NoAccess or non-propagating grant
+  doesn't count), since without it Proxmox lists only the token's own tasks, and every node's task
+  log must reach back to the restore's start (a rebuilt or idle node with nothing that old holds);
+  when any of that is missing or can't be read, the reconciler writes nothing to the guest and
+  holds the row. When a later step fails after the check passed, the guest is
+  neutralised without the delete (an over-quota failure excepted). An in-place MateState restore of
+  a container gets the check with snapshots allowed (each snapshot's config is checked) and, on
+  failure, the same neutralising without the delete, then a hold. The archive's guest firewall
+  (rules, IP sets, aliases, `radv`/log options, and with isolation off also `enable` and the
+  policies) is cleared before isolation is applied. An admin's adopt checks a machine restored from
+  an uploaded backup, or an untagged guest, against the upload-archive allowlist, and any other
+  machine against the rollback policy (no host-level key, no foreign volume, no pending change —
+  a template's `rng0`, spice `usbN`, `audio0` or `watchdog` are fine), approved PCI devices excepted,
+  in its config and every snapshot. For a restored or untagged guest it also removes autostart and
+  the archive firewall before isolation, and it brings NICs a hold took down back up. Uploaded configs
+  are checked section by section (snapshots, `[special:cloudinit]`), a `[PENDING]` section is
+  refused up front, a disk line's volume (and a snapshot's `vmstate`) is read from its
+  `file=`/`volume=` item or bare first item, and a line ProxMate can't read refuses the archive.
+- Every `unusedN` on the freshly restored guest is treated as foreign, since the pre-restore volume
+  listing cannot see volumes of a VMID outside the pool. Uploads ProxMate wrote carry a
+  `.proxmate-uploaded.<name>` marker noting the VMID being restored; a startup sweep removes marked
+  archives (and stalled `.part` files) older than six hours unless that VMID's machine is still
+  being created. Uploads are moved into place with a hard link, so an existing file is never
+  replaced.
+- **Backups of a guest that is gone** are not reachable through the pool: the token cannot list
+  them, read their config or delete them. A machine whose rebuild failed after its guest was
+  destroyed is in that state; restore one of its backups as root, or rebuild the machine first (its
+  VMID back in the pool makes the backups reachable again). The connection test lists such rows.
+- An earlier `ProxMate` grant on `/` is kept until `--drop-root-grant`, which runs after the token's
+  new ACLs are in place and warns when the pool holds no guests yet. While the grant exists the
+  connection test warns that the pool limits nothing, and the admin "Move managed guests into the
+  pool" action can still reach every guest carrying a ProxMate ownership marker. It sends one request
+  per guest and reports each refusal (a guest in another pool also needs `Pool.Allocate` there).
+- The connection test checks, with a pool set: the pool exists (blocking if not, when the token
+  holds `Pool.Audit`), `VM.Allocate` on the pool (blocking when held neither there nor on `/vms`),
+  each other guest privilege on `/pool/<name>`, guest privileges still on `/` or `/vms`,
+  `Sys.Modify` on `/` (quiet once the cluster firewall is on), `Datastore.Allocate` on all of
+  `/storage`, a snippet storage without the snippets content type,
+  cloud-image download rights, managed guests outside the pool, and rows whose guest is not visible.[^pool]
+- Not yet proven on hardware: the table is derived from the documented ACL paths and the API calls
+  ProxMate makes. ROADMAP.md lists it as needing live verification.[^roadmap]
+
 # Recommended setup (from the docs)
 
 - Supported path: a token with privilege separation **off**:
@@ -130,7 +249,7 @@ retrying the call. Everything below is an observation from that cluster, not a r
   `/cluster/status` and `download-url` are checked there. on PVE 9 the role also
   holds `VM.GuestAgent.FileWrite` (`--with-ide`, which used to add it, is still accepted and changes nothing), `--with-passthrough` adds `Mapping.Audit`/`Mapping.Use`,
   `--dry-run` prints the commands. Re-running updates the role and ACLs and never re-issues an
-  existing token.[^deploy][^security]
+  existing token. `--pool <name>` switches to the pool-scoped split above.[^deploy][^security]
 - Troubleshooting row: "Proxmox storage empty / VM create 403" → privilege separation on.[^deploy]
 
 # Gotchas
@@ -147,3 +266,5 @@ retrying the call. Everything below is an observation from that cluster, not a r
 [^security]: SECURITY.md "Recommended: scope the Proxmox API token"
 [^adminguide]: docs/admin-guide.md §1.1
 [^roadmap]: ROADMAP.md
+[^pool]: backend/src/services/guest-pool.service.ts (`checkGuestPool`, `moveManagedGuestsIntoPool`)
+[^script]: deploy/proxmox-token.sh (`--pool`)

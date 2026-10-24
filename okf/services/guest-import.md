@@ -25,12 +25,14 @@ ProxMate otherwise only manages guests it created (each carries its row's `proxm
 
 # Gotchas
 
+- With a Proxmox pool configured (`proxmox_pool`), an imported guest is added to the pool (`PUT /pools`) as the last step, after isolation and the tag, and the response carries a `poolNote`. A guest in another pool is refused with `409` `code: 'pool_move'` unless the request sets `movePool: true` (the UI asks first). A refusal by Proxmox is recorded in the `vm.import` audit entry and does not undo the import. A pool-scoped token sees only guests in the pool, so only those are listed as importable. See [guest-pool](/services/guest-pool.md).
 - Refused: a VMID a row already references, a Template Store VMID, a Proxmox template, any ProxMate tag (a machine's or a template's), a guest locked by a running Proxmox task, a volume that is not the guest's own (`foreignVolumeKeys`, which also catches bind mounts and raw host paths), host devices and host-level settings, any of those in one of the guest's snapshots (a tenant may roll back to it — the snapshots are named, to be deleted first), a container without a core limit, and a disk with no recorded size. A PCI device is attached afterwards through a [passthrough request](/services/passthrough-request.md).[^imp]
 - Imports of one VMID run one at a time (an in-process per-VMID lock), so two admins importing the same guest can't both succeed: the second finds the row and is refused.[^imp]
 - A quota-exempt import is always `adminManaged` (a tenant who could resize a free grant would bypass quota); otherwise `adminManaged` defaults to true for another user's account.[^imp]
 - Isolation is applied before the tag is written, while the row is `creating` (which every tenant action refuses): a failure part-way never leaves a tagged guest without its firewall. If isolation or the tag write fails, the row is dropped and the error says the guest is still unmanaged (with its network possibly part-changed).[^imp]
 - Import turns on the ProxMate isolation firewall (inbound dropped by default, `firewall=1` on every NIC); the guest's own firewall rules are kept below ProxMate's, so inbound services may need rules added.[^imp]
 - The guest's NICs move to the configured default bridge, so its network changes on import.[^imp]
+- The import records `opKind: import` and counts as in flight while it runs. If a restart cuts it short, the [restart reconciler](/services/task-reconcile.md) completes it when the guest already carries its tag (the last step), and otherwise drops the row so the guest stays importable; it never changes or removes the guest.
 
 # Relationships
 

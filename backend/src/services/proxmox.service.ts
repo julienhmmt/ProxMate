@@ -202,6 +202,47 @@ export async function getClient(): Promise<AxiosInstance> {
   return buildClient(c.host, c.tokenId, c.tokenSecret, c.verifySsl, c.ca);
 }
 
+// ─── Resource pool ────────────────────────────────────────────
+//
+// Optional. With `proxmox_pool` set, every guest ProxMate creates, clones, restores
+// or imports joins that Proxmox resource pool, so the token can be granted its guest
+// privileges on /pool/<name> instead of on / and Proxmox itself refuses it every
+// guest outside the pool. Empty = no pool parameter anywhere (the default).
+
+/** Proxmox pool ids: letters, digits, '-' and '_' (nested pools are not supported here). */
+export const POOL_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
+
+/** The configured guest pool, or undefined when guests are not placed in one. */
+export async function getGuestPool(): Promise<string | undefined> {
+  const pool = (await getConfig('proxmox_pool'))?.trim();
+  return pool ? pool : undefined;
+}
+
+/** The pools the token can see (Proxmox lists a pool only with Pool.Audit on /pool/<id>). */
+export async function listPools(client?: AxiosInstance): Promise<string[]> {
+  const c = client ?? (await getClient());
+  const res = await c.get<{ data: Array<{ poolid?: string }> }>('/pools');
+  return (res.data.data ?? []).map((p) => p.poolid).filter((p): p is string => !!p);
+}
+
+/**
+ * Add guests to a pool, moving them out of any other pool they are in. Needs
+ * Pool.Allocate on /pool/<pool> and VM.Allocate on each guest. Proxmox VE 8.1 moved
+ * this to `PUT /pools` (poolid in the body); 8.0 only has `PUT /pools/{poolid}`.
+ */
+export async function addGuestsToPool(pool: string, vmids: number[], client?: AxiosInstance): Promise<void> {
+  if (vmids.length === 0) return;
+  const c = client ?? (await getClient());
+  const body = { vms: vmids.join(','), 'allow-move': '1' };
+  try {
+    await c.put('/pools', new URLSearchParams({ poolid: pool, ...body }));
+  } catch (err) {
+    const status = err instanceof AxiosError ? err.response?.status : undefined;
+    if (status !== 501 && status !== 404) throw err;
+    await c.put(`/pools/${encodeURIComponent(pool)}`, new URLSearchParams(body));
+  }
+}
+
 /** Extract a human-readable message from a Proxmox/axios error. */
 export function pveMessage(err: unknown): string {
   if (err instanceof AxiosError) {
@@ -239,6 +280,18 @@ export async function getEffectivePermissions(client?: AxiosInstance): Promise<P
   const c = client ?? (await getClient());
   const res = await c.get<{ data: PvePermissions }>('/access/permissions');
   return res.data.data ?? {};
+}
+
+/**
+ * The caller's effective privileges on exactly one path (`/access/permissions?path=`),
+ * as Proxmox computes them there: unlike the full listing, a path where an ACL takes
+ * privileges away (NoAccess, or a grant above that doesn't propagate) answers for
+ * itself instead of being left out. Throws when it can't be read.
+ */
+export async function getPathPermissions(path: string, client?: AxiosInstance): Promise<Record<string, number>> {
+  const c = client ?? (await getClient());
+  const res = await c.get<{ data: PvePermissions }>('/access/permissions', { params: { path } });
+  return res.data.data?.[path] ?? {};
 }
 
 /**
@@ -885,6 +938,8 @@ export interface CreateVmConfig {
   iso: string; // ISO filename
   /** Proxmox tags (`;`-separated) — carries ProxMate's ownership marker. */
   tags?: string;
+  /** Resource pool the new guest joins (the `proxmox_pool` setting); see getGuestPool. */
+  pool?: string;
 }
 
 /** Create a QEMU VM. Returns the Proxmox task UPID. */
@@ -906,6 +961,7 @@ export async function createVm(config: CreateVmConfig, client?: AxiosInstance): 
     agent: '1',
   });
   if (config.tags) params.set('tags', config.tags);
+  if (config.pool) params.set('pool', config.pool);
   const res = await c.post<{ data: string }>(`/nodes/${config.node}/qemu`, params);
   return res.data.data;
 }
@@ -928,6 +984,8 @@ export interface CreateLxcConfig {
   unprivileged?: boolean; // default true
   /** Proxmox tags (`;`-separated) — carries ProxMate's ownership marker. */
   tags?: string;
+  /** Resource pool the new container joins; see getGuestPool. */
+  pool?: string;
 }
 
 /**
@@ -954,6 +1012,7 @@ export async function createLxc(config: CreateLxcConfig, client?: AxiosInstance)
   if (config.password) params.set('password', config.password);
   if (config.sshPublicKeys) params.set('ssh-public-keys', config.sshPublicKeys);
   if (config.tags) params.set('tags', config.tags);
+  if (config.pool) params.set('pool', config.pool);
   const res = await c.post<{ data: string }>(`/nodes/${config.node}/lxc`, params);
   return res.data.data;
 }
@@ -1091,6 +1150,8 @@ export interface CloudInitVmConfig {
   memory?: number; // MB
   /** Proxmox tags (`;`-separated), e.g. a build tag that marks the guest as this build's. */
   tags?: string;
+  /** Resource pool the new VM joins; see getGuestPool. */
+  pool?: string;
 }
 
 /**
@@ -1121,6 +1182,7 @@ export async function createCloudInitVm(config: CloudInitVmConfig, client?: Axio
     agent: '1',
   });
   if (config.tags) params.set('tags', config.tags);
+  if (config.pool) params.set('pool', config.pool);
   const res = await c.post<{ data: string }>(`/nodes/${config.node}/qemu`, params);
   return res.data.data;
 }
@@ -1465,6 +1527,10 @@ export async function cloneVm(
     storage?: string;
     /** Node the clone lands on, when not the source's. Proxmox allows it only for shared storage. */
     target?: string;
+    /** Resource pool the clone joins; see getGuestPool. */
+    pool?: string;
+    /** The clone's description (ProxMate writes its row nonce here; see cloneNonce). */
+    description?: string;
   },
   client?: AxiosInstance,
 ): Promise<string> {
@@ -1476,6 +1542,8 @@ export async function cloneVm(
   });
   if (opts.full && opts.storage) params.set('storage', opts.storage);
   if (opts.target && opts.target !== opts.node) params.set('target', opts.target);
+  if (opts.pool) params.set('pool', opts.pool);
+  if (opts.description) params.set('description', opts.description);
   const res = await c.post<{ data: string }>(
     `/nodes/${opts.node}/qemu/${opts.templateVmid}/clone`,
     params,
@@ -1488,12 +1556,71 @@ export async function getTaskStatus(
   node: string,
   upid: string,
   client?: AxiosInstance,
-): Promise<{ status: string; exitstatus?: string }> {
+): Promise<{ status: string; exitstatus?: string; starttime?: number }> {
   const c = client ?? (await getClient());
-  const res = await c.get<{ data: { status: string; exitstatus?: string } }>(
+  const res = await c.get<{ data: { status: string; exitstatus?: string; starttime?: number } }>(
     `/nodes/${node}/tasks/${encodeURIComponent(upid)}/status`,
   );
   return res.data.data;
+}
+
+/** Thrown by waitForTask when Proxmox reports the task itself as failed. */
+export class TaskFailedError extends Error {
+  constructor(public readonly exitstatus: string) {
+    super(`Proxmox task failed: ${exitstatus}`);
+    this.name = 'TaskFailedError';
+  }
+}
+
+/** One page of the task lists `listVmidTasks` reads. */
+export const VMID_TASK_PAGE = 500;
+/** Pages read before a VMID's task list counts as too long to be complete. */
+const VMID_TASK_MAX_PAGES = 20;
+
+/**
+ * Every task a node lists for one VMID since `since` (epoch seconds), finished and
+ * running alike, read page by page until a short page. Null when the list is
+ * longer than VMID_TASK_MAX_PAGES pages (it can't be shown complete). Throws when
+ * the node's task list can't be read. Without Sys.Audit on the node Proxmox lists
+ * only the caller's own tasks, so callers check that privilege first.
+ */
+export async function listVmidTasks(
+  node: string,
+  vmid: number,
+  since: number,
+  client?: AxiosInstance,
+): Promise<Array<{ upid: string; type: string; starttime?: number }> | null> {
+  const c = client ?? (await getClient());
+  const out: Array<{ upid: string; type: string; starttime?: number }> = [];
+  let total: number | undefined;
+  for (let page = 0; page < VMID_TASK_MAX_PAGES; page += 1) {
+    const res = await c.get<{ data: Array<{ upid: string; type: string; starttime?: number }>; total?: number }>(
+      `/nodes/${node}/tasks`,
+      { params: { vmid, since, source: 'all', start: page * VMID_TASK_PAGE, limit: VMID_TASK_PAGE } },
+    );
+    // The list changing length between pages means entries may have shifted past a page edge.
+    if (typeof res.data.total === 'number') {
+      if (total !== undefined && res.data.total !== total) return null;
+      total = res.data.total;
+    }
+    const rows = res.data.data ?? [];
+    out.push(...rows);
+    if (rows.length < VMID_TASK_PAGE) return out;
+  }
+  return null;
+}
+
+/**
+ * Whether a node's task log still holds a task (any VMID, any user) that started at
+ * or before `until` (epoch seconds), i.e. the log reaches back at least that far.
+ * Throws when the node's task list can't be read.
+ */
+export async function taskLogReaches(node: string, until: number, client?: AxiosInstance): Promise<boolean> {
+  const c = client ?? (await getClient());
+  const res = await c.get<{ data: Array<{ starttime?: number }> }>(`/nodes/${node}/tasks`, {
+    params: { source: 'all', until, limit: 1 },
+  });
+  return (res.data.data ?? []).some((t) => typeof t.starttime === 'number' && t.starttime <= until);
 }
 
 /** Poll a Proxmox task (UPID) until it finishes; throws if it failed. */
@@ -1515,7 +1642,7 @@ export async function waitForTask(
       // non-fatal warnings "WARNINGS: N" — the latter is a success (common for LXC
       // creates and vzdump backups). Anything else is a genuine failure.
       if (exitstatus && exitstatus !== 'OK' && !exitstatus.startsWith('WARNINGS')) {
-        throw new Error(`Proxmox task failed: ${exitstatus}`);
+        throw new TaskFailedError(exitstatus);
       }
       return;
     }
@@ -2266,6 +2393,22 @@ export async function storageNodes(storage: string, client?: AxiosInstance): Pro
 }
 
 /**
+ * The nodes a storage is available on (from `/cluster/resources`, which needs only
+ * Datastore.Audit), and whether it is shared storage every node sees the same.
+ */
+export async function storagePlacement(
+  storage: string,
+  client?: AxiosInstance,
+): Promise<{ nodes: string[]; shared: boolean }> {
+  const c = client ?? (await getClient());
+  const res = await c.get<{ data: ClusterResource[] }>('/cluster/resources', { params: { type: 'storage' } });
+  const entries = (res.data.data ?? []).filter(
+    (s) => s.storage === storage && s.node && (!s.status || s.status === 'available'),
+  );
+  return { nodes: [...new Set(entries.map((s) => s.node!))], shared: entries.some((s) => s.shared === 1) };
+}
+
+/**
  * Whether a VM config exposes a serial port (e.g. `serial0`), which is required
  * for the xterm.js text console (Proxmox `termproxy`). ProxMate's cloud-init VMs
  * are built with `serial0: 'socket'`; ISO VMs typically have none.
@@ -2745,10 +2888,11 @@ export async function deleteBackup(
  * Restore a backup into an EXISTING VMID (overwrites the guest in place). The
  * guest must be stopped first. Returns the Proxmox task UPID. QEMU and LXC use
  * different restore shapes: QEMU takes `archive=<volid>` on POST /qemu; LXC takes
- * `ostemplate=<volid>` + `restore=1` on POST /lxc.
+ * `ostemplate=<volid>` + `restore=1` on POST /lxc. `pool`, when given, also adds the
+ * guest to that pool; an in-place restore keeps the membership it had without it.
  */
 export async function restoreBackup(
-  opts: { node: string; vmid: number; volid: string; storage?: string },
+  opts: { node: string; vmid: number; volid: string; storage?: string; pool?: string },
   client?: AxiosInstance,
   kind: GuestKind = 'qemu',
 ): Promise<string> {
@@ -2761,6 +2905,7 @@ export async function restoreBackup(
       force: '1', // overwrite the existing container
     });
     if (opts.storage) params.set('storage', opts.storage);
+    if (opts.pool) params.set('pool', opts.pool);
     const res = await c.post<{ data: string }>(`/nodes/${opts.node}/lxc`, params);
     return res.data.data;
   }
@@ -2770,6 +2915,7 @@ export async function restoreBackup(
     force: '1', // overwrite the existing VM
   });
   if (opts.storage) params.set('storage', opts.storage);
+  if (opts.pool) params.set('pool', opts.pool);
   const res = await c.post<{ data: string }>(`/nodes/${opts.node}/qemu`, params);
   return res.data.data;
 }
@@ -2782,7 +2928,7 @@ export async function restoreBackup(
  * storage names inside the archive's config may not exist here.
  */
 export async function restoreNewGuest(
-  opts: { node: string; vmid: number; volid: string; storage?: string },
+  opts: { node: string; vmid: number; volid: string; storage?: string; pool?: string },
   client?: AxiosInstance,
   kind: GuestKind = 'qemu',
 ): Promise<string> {
@@ -2792,6 +2938,7 @@ export async function restoreNewGuest(
     unique: '1',
   });
   if (opts.storage) params.set('storage', opts.storage);
+  if (opts.pool) params.set('pool', opts.pool);
   if (kind === 'lxc') {
     params.set('ostemplate', opts.volid);
     params.set('restore', '1');
@@ -2877,6 +3024,18 @@ export async function listSnapshots(
   return (res.data.data ?? [])
     .filter((s) => s.name !== 'current')
     .sort((a, b) => (b.snaptime ?? 0) - (a.snaptime ?? 0));
+}
+
+/**
+ * Whether Proxmox can snapshot this VM as it is configured now — false when one
+ * of its disks sits on storage without snapshot support (plain LVM, raw files).
+ */
+export async function canSnapshot(node: string, vmid: number, client?: AxiosInstance): Promise<boolean> {
+  const c = client ?? (await getClient());
+  const res = await c.get<{ data: { hasFeature?: number | boolean } }>(
+    `/nodes/${node}/qemu/${vmid}/feature?feature=snapshot`,
+  );
+  return !!res.data.data?.hasFeature;
 }
 
 /** Create a snapshot (optionally capturing RAM state). Returns the task UPID. */
@@ -3378,6 +3537,55 @@ export async function readIsolationOptions(): Promise<{ dnsServers: string[]; vl
   // VLAN at all.
   const vlanTag = raw && Number.isInteger(parsed) && parsed >= 1 && parsed <= 4094 ? parsed : undefined;
   return { dnsServers, ...(vlanTag !== undefined ? { vlanTag } : {}) };
+}
+
+/**
+ * Clear the guest-level firewall a restore brought back from the archive's
+ * `qemu-server.fw` / `pct.fw` — every rule, IP set and alias, and the options
+ * isolation does not set itself — so what applies afterwards is only what ProxMate
+ * writes (configureVmIsolation, the IDE pinhole). Rules go highest position first,
+ * since removing one renumbers those above it.
+ */
+export async function resetRestoredFirewall(
+  node: string,
+  vmid: number,
+  client?: AxiosInstance,
+  kind: GuestKind = 'qemu',
+): Promise<void> {
+  const c = client ?? (await getClient());
+  const base = `/nodes/${node}/${kind}/${vmid}/firewall`;
+  const rules = (await c.get<{ data: Array<{ pos: number }> }>(`${base}/rules`)).data.data ?? [];
+  for (const pos of rules.map((r) => r.pos).sort((a, b) => b - a)) await c.delete(`${base}/rules/${pos}`);
+  const ipsets = (await c.get<{ data: Array<{ name: string }> }>(`${base}/ipset`)).data.data ?? [];
+  for (const { name } of ipsets) {
+    const set = `${base}/ipset/${encodeURIComponent(name)}`;
+    const members = (await c.get<{ data: Array<{ cidr: string }> }>(set)).data.data ?? [];
+    for (const { cidr } of members) await c.delete(`${set}/${encodeURIComponent(cidr)}`);
+    await c.delete(set);
+  }
+  const aliases = (await c.get<{ data: Array<{ name: string }> }>(`${base}/aliases`)).data.data ?? [];
+  for (const { name } of aliases) await c.delete(`${base}/aliases/${encodeURIComponent(name)}`);
+  // With isolation on, configureVmIsolation sets enable and the policies next; with it
+  // off nothing would, so the archive's are removed too.
+  const isolate = (await getConfig('isolation_enabled')) !== 'false';
+  const stray = isolate ? 'radv,log_level_in,log_level_out' : 'radv,log_level_in,log_level_out,enable,policy_in,policy_out';
+  await c.put(`${base}/options`, new URLSearchParams({ delete: stray }));
+}
+
+/** Bring back up every NIC a hold set to `link_down=1`. */
+export async function clearLinkDown(
+  node: string,
+  vmid: number,
+  client?: AxiosInstance,
+  kind: GuestKind = 'qemu',
+): Promise<void> {
+  const c = client ?? (await getClient());
+  const cfg = await getVmConfig(node, vmid, c, kind);
+  for (const [key, value] of Object.entries(cfg)) {
+    if (!/^net\d+$/.test(key) || !/(^|,)link_down=1(,|$)/.test(String(value))) continue;
+    const up = String(value).split(',').filter((p) => !/^link_down=/.test(p)).join(',');
+    await c.put(`/nodes/${node}/${kind}/${vmid}/config`, new URLSearchParams({ [key]: up }));
+  }
 }
 
 export async function configureVmIsolation(

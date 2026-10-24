@@ -32,6 +32,7 @@ import * as pve from '../src/services/proxmox.service.js';
 import { guestMarker, QuotaError, syncRestoredGuest, resizeVm } from '../src/services/vm.service.js';
 import { restoreFromMateState } from '../src/services/matestate.service.js';
 import { fakeClient, asClient, bodyOf } from './helpers.js';
+import { getConfig } from '../src/services/config.service.js';
 
 const ok = (data: unknown) => Promise.resolve({ data: { data } });
 const VOLID = 'backups:backup/vzdump-qemu-100-2026_10_01-03_00_00.vma.zst';
@@ -55,7 +56,7 @@ function fakePve(live: Record<string, string>, archive: Record<string, string>) 
     return ok(null);
   });
   c.post.mockImplementation((url: string) => {
-    if (url === '/nodes/pve1/qemu') state.cfg = { ...archive };
+    if (url === '/nodes/pve1/qemu' || url === '/nodes/pve1/lxc') state.cfg = { ...archive };
     if (/status\/start$/.test(url)) state.status = 'running';
     return ok('UPID:fake');
   });
@@ -96,6 +97,15 @@ beforeEach(() => {
   );
   vi.mocked(prisma.user.findUnique).mockResolvedValue({ id: 'u1', role: 'user', maxCpu: 8, maxRam: 16384, maxStorage: 200, accessExpiresAt: null } as never);
   vi.mocked(prisma.virtualMachine.findMany).mockResolvedValue([] as never);
+});
+
+describe('MateState restore of a row still being created', () => {
+  it('is refused before anything is stopped or restored', async () => {
+    const { c } = fakePve(LIVE, LIVE);
+    await expect(restoreFromMateState(row({ status: 'creating' }), ms)).rejects.toThrow(/still being created/);
+    expect(c.post).not.toHaveBeenCalled();
+    expect(prisma.mateState.update).not.toHaveBeenCalled();
+  });
 });
 
 describe('MateState restore: resources come back only within quota (BUG-024)', () => {
@@ -285,5 +295,67 @@ describe('syncRestoredGuest', () => {
       where: { id: 'rowa' },
       data: expect.objectContaining({ cpu: 1, ram: 1024, storage: 132 }),
     });
+  });
+});
+
+describe('restore with a Proxmox pool configured', () => {
+  it('sends no pool on the in-place restore (the guest keeps its membership)', async () => {
+    const base = vi.mocked(getConfig).getMockImplementation()!;
+    vi.mocked(getConfig).mockImplementation(async (key: string) => (key === 'proxmox_pool' ? 'proxmate' : base(key)));
+    try {
+      const { c } = fakePve(LIVE, { ...LIVE });
+      await restoreFromMateState(row(), ms);
+      const restore = c.post.mock.calls.find((x) => x[0] === '/nodes/pve1/qemu');
+      expect(bodyOf(restore!)).toMatchObject({ archive: VOLID, force: '1' });
+      expect(bodyOf(restore!)).not.toHaveProperty('pool');
+    } finally {
+      vi.mocked(getConfig).mockImplementation(base);
+    }
+  });
+});
+
+describe('container restore: the restored config is checked as Proxmox holds it', () => {
+  const CT = {
+    arch: 'amd64', hostname: 'ct', unprivileged: '1', cores: '1', memory: '1024', tags: marker,
+    rootfs: 'local-lvm:subvol-100-disk-0,size=32G', net0: 'name=eth0,bridge=vmbr0,firewall=1,ip=dhcp',
+  };
+  const ctRow = () => row({ type: 'lxc' });
+
+  it('refuses a restore that brought back a host device (a pct.conf inside the rootfs), and never starts it', async () => {
+    vi.mocked(prisma.virtualMachine.findUnique).mockResolvedValue(ctRow());
+    const { c } = fakePve(CT, { ...CT, dev0: '/dev/sda' });
+    await expect(restoreFromMateState(ctRow(), ms)).rejects.toThrow(/settings ProxMate won't restore \("dev0"\)/);
+    expect(c.post.mock.calls.some((x) => /status\/start$/.test(String(x[0])))).toBe(false);
+    // Kept (the tenant's own machine), but neutralised: no autostart, no device, NIC down.
+    const puts = c.put.mock.calls.filter((x) => /\/lxc\/100\/config$/.test(String(x[0]))).map(bodyOf);
+    expect(puts).toContainEqual({ delete: 'onboot' });
+    expect(puts).toContainEqual({ delete: 'dev0' });
+    expect(puts.some((b) => /link_down=1/.test(b['net0'] ?? ''))).toBe(true);
+    expect(c.delete).not.toHaveBeenCalledWith('/nodes/pve1/lxc/100');
+    expect(prisma.virtualMachine.update).toHaveBeenCalledWith({ where: { id: 'rowa' }, data: expect.objectContaining({ status: 'error' }) });
+  });
+
+  it('accepts a clean container restore', async () => {
+    vi.mocked(prisma.virtualMachine.findUnique).mockResolvedValue(ctRow());
+    const { c } = fakePve(CT, { ...CT });
+    await restoreFromMateState(ctRow(), ms);
+    expect(c.post.mock.calls.some((x) => /lxc\/100\/status\/start$/.test(String(x[0])))).toBe(true);
+  });
+});
+
+describe('in-place restore: autostart and later failures', () => {
+  it('drops the archive\'s autostart and protection before the guest is checked, tagged or started', async () => {
+    const { state } = fakePve(LIVE, { ...LIVE, onboot: '1', protection: '1' });
+    await restoreFromMateState(row(), ms);
+    expect(state.cfg['onboot']).toBeUndefined();
+    expect(state.cfg['protection']).toBeUndefined();
+  });
+
+  it('takes the NIC down when a step after the restore fails, and leaves the guest in place', async () => {
+    vi.mocked(pve.configureVmIsolation).mockRejectedValueOnce(new Error('firewall API down'));
+    const { c, state } = fakePve(LIVE, { ...LIVE });
+    await expect(restoreFromMateState(row(), ms)).rejects.toThrow(/firewall API down/);
+    expect(state.cfg['net0']).toMatch(/link_down=1/);
+    expect(c.delete).not.toHaveBeenCalledWith('/nodes/pve1/qemu/100');
   });
 });

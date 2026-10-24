@@ -21,6 +21,7 @@ import {
 } from './vm.service.js';
 import { parseGuestConfigText, pciLines, foreignVolumeKeys, hostLevelKeys } from '../lib/guest-config.js';
 import { IDE_GUEST_PORT } from './ide-provision.service.js';
+import { beginInFlight } from '../lib/in-flight.js';
 
 /** Rolling retention: only this many MateStates are kept per VM. */
 export const MATESTATE_RETENTION = 2;
@@ -124,6 +125,7 @@ export async function createMateState(
       kind,
     },
   });
+  const done = beginInFlight(placeholder.id);
 
   let upid: string | undefined;
   let unidentified = false;
@@ -132,6 +134,8 @@ export async function createMateState(
       { node: vm.proxmoxNode, vmid: vm.proxmoxVmId, storage, mode: 'snapshot' },
       client,
     );
+    // Kept so a restart mid-backup can still settle this row from the task.
+    await recordMateStateTask(placeholder.id, upid);
     // vzdump can take a while on real workloads — give it up to 30 minutes.
     await pve.waitForTask(vm.proxmoxNode, upid, client, 30 * 60 * 1000);
 
@@ -153,7 +157,7 @@ export async function createMateState(
 
     const updated = await prisma.mateState.update({
       where: { id: placeholder.id },
-      data: { volid: fresh.volid, size: BigInt(Math.trunc(fresh.size ?? 0)), status: 'ready' },
+      data: { volid: fresh.volid, size: BigInt(Math.trunc(fresh.size ?? 0)), status: 'ready', upid: null },
     });
 
     await pruneOldMateStates(vm.id, vm.backupKeep ?? MATESTATE_RETENTION);
@@ -167,7 +171,14 @@ export async function createMateState(
       await removeTaskArchive(vm.proxmoxNode, upid, storage, vm.proxmoxVmId, client);
     }
     throw err;
+  } finally {
+    done();
   }
+}
+
+/** Best-effort: note the Proxmox task now driving a MateState row (backup or restore). */
+async function recordMateStateTask(id: string, upid: string): Promise<void> {
+  await (async () => prisma.mateState.update({ where: { id }, data: { upid } }))().catch(() => undefined);
 }
 
 /**
@@ -249,6 +260,15 @@ export async function reapplyIsolation(
 export async function restoreFromMateState(vm: VirtualMachine, mateState: MateState): Promise<void> {
   if (mateState.vmId !== vm.id) throw new Error('MateState does not belong to this VM');
   if (mateState.status !== 'ready') throw new Error('MateState is not ready');
+  const done = beginInFlight(vm.id, mateState.id);
+  try {
+    await restoreFromMateStateTracked(vm, mateState);
+  } finally {
+    done();
+  }
+}
+
+async function restoreFromMateStateTracked(vm: VirtualMachine, mateState: MateState): Promise<void> {
 
   const client = await pve.getClient();
   const kind: pve.GuestKind = vm.type === 'lxc' ? 'lxc' : 'qemu';
@@ -311,13 +331,16 @@ export async function restoreFromMateState(vm: VirtualMachine, mateState: MateSt
 
     await prisma.mateState.update({ where: { id: mateState.id }, data: { status: 'restoring' } });
     const upid = await pve.restoreBackup(
+      // No `pool`: an in-place restore keeps the guest's pool membership, and naming
+      // a pool would fail for a guest an admin has since put in another one.
       { node: vm.proxmoxNode, vmid: vm.proxmoxVmId, volid: mateState.volid, storage: restoreStorage },
       client,
       kind,
     );
     taskStarted = true;
+    await recordMateStateTask(mateState.id, upid);
     await pve.waitForTask(vm.proxmoxNode, upid, client, 30 * 60 * 1000);
-    await prisma.mateState.update({ where: { id: mateState.id }, data: { status: 'ready' } });
+    await prisma.mateState.update({ where: { id: mateState.id }, data: { status: 'ready', upid: null } });
     vm = await settleRestoredGuest(vm, approvedPci, client);
     // Powering on is what every start path gates on the owner's compute-access
     // window; a restore by a share-holder must not revive a suspended owner's
@@ -329,7 +352,7 @@ export async function restoreFromMateState(vm: VirtualMachine, mateState: MateSt
       data: { status: ownerActive ? 'running' : 'stopped', holdReason: null },
     });
   } catch (err) {
-    await prisma.mateState.update({ where: { id: mateState.id }, data: { status: 'ready' } });
+    await prisma.mateState.update({ where: { id: mateState.id }, data: { status: 'ready', upid: null } });
     await afterFailedRestore(vm, reservation, taskStarted, err);
     throw err;
   }
@@ -346,16 +369,53 @@ async function settleRestoredGuest(
   approvedPci: string[],
   client: Awaited<ReturnType<typeof pve.getClient>>,
 ): Promise<VirtualMachine> {
-  try {
-    // The config came back with its tags (a backup or snapshot from before
-    // ownership tags existed has none) — tag it as this row's again.
-    await markClonedGuest(vm, client);
-  } finally {
-    await reapplyIsolation(vm, client);
+  const kind: pve.GuestKind = vm.type === 'lxc' ? 'lxc' : 'qemu';
+  // Loaded lazily (restore-upload imports this module).
+  const { stripRestoreFlags, neutraliseAfterFailure } = await import('./restore-upload.service.js');
+  // A restored config may carry autostart or protection: nothing may start the
+  // guest on its own while it is being made safe, so they go first.
+  await stripRestoreFlags(vm.proxmoxNode, vm.proxmoxVmId, client, kind).catch(() => undefined);
+  // A container restore applies the `etc/vzdump/pct.conf` it finds in the backed-up
+  // rootfs, which the tenant controls: check what Proxmox actually restored before
+  // the guest is tagged, isolated or started. Loaded lazily (restore-upload imports
+  // this module).
+  if (vm.type === 'lxc') {
+    const { assertRestoredGuestConfig, neutraliseRestoredGuest, RestoredConfigError } = await import(
+      './restore-upload.service.js'
+    );
+    try {
+      await assertRestoredGuestConfig(vm.proxmoxNode, vm.proxmoxVmId, 'lxc', client, { allowSnapshots: true });
+    } catch (err) {
+      // The tenant's own machine is kept (held), but nothing may start it as it is.
+      const bad = err instanceof RestoredConfigError ? err : null;
+      await neutraliseRestoredGuest(vm.proxmoxNode, vm.proxmoxVmId, 'lxc', client, {
+        keys: bad?.keys,
+        pendingKeys: bad?.pendingKeys,
+        destroy: false,
+      });
+      throw err;
+    }
+    // Its guest firewall came from the archive, which the rootfs can override:
+    // isolation below writes ProxMate's own again.
+    await pve.resetRestoredFirewall(vm.proxmoxNode, vm.proxmoxVmId, client, 'lxc');
   }
-  // Only this guest's own volumes, whatever the archive or snapshot referenced.
-  await assertOwnVolumes(vm, client);
-  return syncRestoredGuest(vm, { approvedPci, client });
+  try {
+    try {
+      // The config came back with its tags (a backup or snapshot from before
+      // ownership tags existed has none) — tag it as this row's again.
+      await markClonedGuest(vm, client);
+    } finally {
+      await reapplyIsolation(vm, client);
+    }
+    // Only this guest's own volumes, whatever the archive or snapshot referenced.
+    await assertOwnVolumes(vm, client);
+    return await syncRestoredGuest(vm, { approvedPci, client });
+  } catch (err) {
+    // The row is held after this; until an admin looks, the guest neither starts on
+    // its own nor reaches the network.
+    await neutraliseAfterFailure(vm.proxmoxNode, vm.proxmoxVmId, kind, client, err);
+    throw err;
+  }
 }
 
 /**

@@ -18,9 +18,10 @@ import { logger } from './lib/logger.js';
 import { loadModules } from './modules/registry.js';
 import { handleConsoleUpgrade } from './routes/console.routes.js';
 import { handleIdeUpgrade } from './services/ide-proxy.service.js';
-import { startScheduler } from './services/scheduler.service.js';
+import { startScheduler, reconcileTick } from './services/scheduler.service.js';
 import { reconcileInterruptedPassthroughApplies } from './services/passthrough-request.service.js';
 import { runGuestMarkerBackfill } from './services/vm.service.js';
+import { sweepStaleUploads } from './services/restore-upload.service.js';
 import { envNumber } from './lib/env-number.js';
 
 const PORT = Math.floor(envNumber('PORT', 4000, 1));
@@ -70,10 +71,23 @@ server.listen(PORT, BIND_ADDR, () => {
   void reconcileInterruptedPassthroughApplies().catch((err) =>
     logger.error({ err }, 'passthrough startup reconcile failed'),
   );
+  // Settle creates, restores, rebuilds and backups the last stop cut short (rows
+  // left `creating`/`restoring`). The scheduler repeats this every 5 minutes.
+  // What is in flight is known per process only (lib/in-flight), so a second
+  // backend on the same database would settle the other's live operations.
+  logger.warn(
+    'interrupted-operation reconciler on: it assumes this is the only backend process on this database',
+  );
+  void reconcileTick();
   // Tag guests created before ProxMate's ownership tag existed (idempotent; only
   // unambiguous matches are tagged, the rest are listed for an admin). The
   // scheduler repeats this until a pass completes without a Proxmox error.
   void runGuestMarkerBackfill()
     .then((r) => logger.info(r, 'guest ownership tag backfill done'))
     .catch((err) => logger.error({ err }, 'guest ownership tag backfill failed'));
+  // Uploaded backups left behind by a restore that never finished (the server
+  // stopped mid-way). Only files ProxMate marked as its own uploads are removed.
+  void sweepStaleUploads()
+    .then((removed) => removed > 0 && logger.info({ removed }, 'stale backup uploads removed'))
+    .catch((err) => logger.error({ err }, 'stale backup upload sweep failed'));
 });

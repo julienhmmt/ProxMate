@@ -208,8 +208,29 @@ firewall, cluster status and cloud-image downloads are checked there). The role 
   covers it, so `FileWrite` is belt-and-braces)
 - for GPU/PCI passthrough only: `Mapping.Audit`, `Mapping.Use`
 
-It needs no user, pool or permission management, and never the node shell. The connection
+It needs no user or permission management, and never the node shell. The connection
 test warns about each missing privilege.
+
+With the role on `/`, the per-guest boundary is ProxMate's ownership-tag check: the token itself
+may act on every guest in the cluster. For a boundary Proxmox enforces, run the script with
+`--pool <name>` and set the same **Proxmox pool** in ProxMate. The guest privileges are then
+granted only on `/pool/<name>` (role `ProxMate-Guest`, which adds `Pool.Audit` and `Pool.Allocate`
+so ProxMate can see the pool, create containers in it and move its own guests into it), and
+ProxMate creates, clones, restores and imports every guest into that pool. What is still needed
+outside the pool is granted on the narrowest path Proxmox checks it on: `Sys.Audit` (and, on 8.2+,
+`Sys.AccessNetwork` for cloud-image downloads) on `/nodes`; `Datastore.Audit`, `.AllocateSpace`
+and `.AllocateTemplate` on `/storage`; `Datastore.Allocate` nowhere unless asked for (only on a
+named snippet or import storage); `SDN.Audit`/`SDN.Use` on `/sdn/zones`; the mapping privileges on
+`/mapping` (only for passthrough); and `Sys.Audit` on `/` without propagation.
+
+Two grants reach past the pool, so they are left out or narrowed: `Sys.Modify` on `/` (cluster
+backup jobs, the cluster firewall's groups and IP sets, cluster options) is granted only with
+`--with-cluster-firewall`, or before Proxmox VE 8.2 where cloud-image downloads need it; while the
+token holds it the pool does not fully contain it, and the script and the connection test say so.
+`Datastore.Allocate` (delete any volume, edit storage definitions) is never granted on all of
+`/storage`. The connection test also warns while the token still holds guest privileges on `/`
+(the pool limits nothing until that grant is removed with `--drop-root-grant`) and while guests
+ProxMate manages are outside the pool. See DEPLOYMENT.md §2.2 for the switch-over steps.
 
 > Note: Proxmox API tokens default to **Privilege Separation ON**, which gives the token an
 > empty permission set. Either disable privilege separation on the token or grant it a role

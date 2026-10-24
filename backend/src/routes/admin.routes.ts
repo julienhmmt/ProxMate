@@ -7,7 +7,7 @@ import { requireAdmin } from '../middleware/admin.js';
 import { enforceMfaSetup } from '../middleware/mfa.js';
 import { assertPublicHttpUrlShape } from '../lib/url-safety.js';
 import { getConfig, setConfig } from '../services/config.service.js';
-import { testProxmoxConnection, saveDefaults } from '../services/setup.service.js';
+import { testProxmoxConnection, saveDefaults, saveGuestPool } from '../services/setup.service.js';
 import {
   isClusterFirewallEnabled,
   getClusterStats,
@@ -20,7 +20,9 @@ import {
   listPciMappings,
   pveMessage,
   NETWORK_NAME_RE,
+  POOL_ID_RE,
 } from '../services/proxmox.service.js';
+import { moveManagedGuestsIntoPool } from '../services/guest-pool.service.js';
 import { listAudit, recordAudit } from '../services/audit.service.js';
 import { getUsageByUser } from '../services/resource-history.service.js';
 import { getLiveStats, addLiveFeedSubscriber } from '../services/live-stats.service.js';
@@ -86,6 +88,12 @@ import { listLlmKeys, getLlmKeyEndpoint } from '../services/tenant-llm-key.servi
 import { probeModels } from '../services/ide-gateway.service.js';
 import { listResetRequests, adminResetPassword } from '../services/password-reset.service.js';
 import { refreshVmIps, getStoragePinningReport } from '../services/vm.service.js';
+import {
+  getAutoSnapshotSettings,
+  saveAutoSnapshotSettings,
+  AUTO_SNAPSHOT_MAX_KEEP,
+} from '../services/auto-snapshot.service.js';
+import { getKeyBackupStatus, confirmKeyBackup } from '../services/key-backup.service.js';
 import type { AuthRequest } from '../types/index.js';
 import { prisma } from '../lib/prisma.js';
 
@@ -109,10 +117,11 @@ router.get('/audit', async (req: Request, res: Response) => {
 // Returns current config (never the Proxmox token secret).
 
 router.get('/settings', async (_req: Request, res: Response) => {
-  const [host, tokenId, verifySsl, storage, bridge, isoStorage, backupStorage, rescueIso, templateRefresh] = await Promise.all([
+  const [host, tokenId, verifySsl, pool, storage, bridge, isoStorage, backupStorage, rescueIso, templateRefresh] = await Promise.all([
     getConfig('proxmox_host'),
     getConfig('proxmox_token_id'),
     getConfig('proxmox_verify_ssl'),
+    getConfig('proxmox_pool'),
     getConfig('default_storage'),
     getConfig('default_bridge'),
     getConfig('iso_storage'),
@@ -127,10 +136,17 @@ router.get('/settings', async (_req: Request, res: Response) => {
   // reported only as "is one set" plus a masked form that shows where it points.
   const { webhookUrl, ntfyUrl, ntfyToken, telegramBotToken, ...notifyCfg } = await getNotifyConfig();
   res.json({
-    proxmox: { host, tokenId, verifySsl: verifySsl === 'true', hasSecret: !!(await getConfig('proxmox_token_secret')) },
+    proxmox: {
+      host,
+      tokenId,
+      verifySsl: verifySsl === 'true',
+      pool: pool ?? '',
+      hasSecret: !!(await getConfig('proxmox_token_secret')),
+    },
     defaults: { storage, bridge, isoStorage, backupStorage },
     rescueIso,
     templateRefreshEnabled: templateRefresh === 'true',
+    autoSnapshot: await getAutoSnapshotSettings(),
     smtp: mail
       ? { configured: true, host: mail.host, port: mail.port, secure: mail.secure, user: mail.user ?? '', from: mail.from, hasPass: !!mail.pass }
       : { configured: false },
@@ -622,6 +638,12 @@ const ProxmoxUpdateSchema = z.object({
   tokenId: z.string().min(1),
   tokenSecret: z.string().optional(),
   verifySsl: z.boolean().default(true),
+  // Optional resource pool for every guest ProxMate creates; '' clears it, omitted keeps it.
+  pool: z
+    .string()
+    .trim()
+    .refine((v) => v === '' || POOL_ID_RE.test(v), "Pool names use only letters, digits, '-' and '_'.")
+    .optional(),
 });
 
 router.put('/settings/proxmox', async (req: Request, res: Response) => {
@@ -630,11 +652,14 @@ router.put('/settings/proxmox', async (req: Request, res: Response) => {
     res.status(400).json({ error: 'Validation failed', details: parsed.error.flatten() });
     return;
   }
-  const { host, tokenId, tokenSecret, verifySsl } = parsed.data;
+  const { host, tokenId, tokenSecret, verifySsl, pool } = parsed.data;
+  const poolBefore = (await getConfig('proxmox_pool')) ?? '';
 
   await setConfig('proxmox_host', host);
   await setConfig('proxmox_token_id', tokenId);
   await setConfig('proxmox_verify_ssl', String(verifySsl));
+  if (pool !== undefined) await saveGuestPool(pool);
+  const poolChanged = pool !== undefined && pool !== poolBefore;
   const secretReplaced = !!tokenSecret && tokenSecret.trim().length > 0;
   if (secretReplaced) {
     await setConfig('proxmox_token_secret', tokenSecret, true);
@@ -645,7 +670,9 @@ router.put('/settings/proxmox', async (req: Request, res: Response) => {
   await recordAudit({
     action: 'admin.proxmox_config',
     actor: (req as AuthRequest).user,
-    detail: `${host} as ${tokenId}, verifySsl=${verifySsl}${secretReplaced ? ', secret replaced' : ''}`,
+    detail:
+      `${host} as ${tokenId}, verifySsl=${verifySsl}${secretReplaced ? ', secret replaced' : ''}` +
+      (poolChanged ? `, pool: ${poolBefore || '(none)'} → ${pool || '(none)'}` : ''),
     req,
   });
   res.json({ success: true });
@@ -660,6 +687,32 @@ router.post('/settings/proxmox/test', async (_req: Request, res: Response) => {
   } catch (err) {
     const msg = err instanceof Error ? err.message : 'Connection failed';
     res.status(502).json({ connected: false, error: msg });
+  }
+});
+
+// ─── POST /api/admin/settings/proxmox/pool/move-guests ────────
+// Put every guest carrying a ProxMate ownership marker into the configured pool,
+// so a token scoped to the pool can still reach it. Guests without a marker are
+// never touched.
+
+router.post('/settings/proxmox/pool/move-guests', async (req: Request, res: Response) => {
+  try {
+    const result = await moveManagedGuestsIntoPool();
+    await recordAudit({
+      action: 'admin.proxmox_pool_move',
+      actor: (req as AuthRequest).user,
+      detail:
+        (result.moved.length > 0
+          ? `moved into ${result.pool}: ${result.moved.map((g) => g.vmid).join(', ')}`
+          : `nothing moved into ${result.pool}`) +
+        (result.failed.length > 0
+          ? `; refused: ${result.failed.map((g) => `${g.vmid} (${g.error})`).join(', ')}`
+          : ''),
+      req,
+    });
+    res.json(result);
+  } catch (err) {
+    res.status(502).json({ error: pveMessage(err) });
   }
 });
 
@@ -752,6 +805,48 @@ router.put('/settings/template-refresh', async (req: Request, res: Response) => 
     req,
   });
   res.json({ success: true });
+});
+
+// ─── PUT /api/admin/settings/auto-snapshot ────────────────────
+// Automatic snapshots before a resize, data-disk grow or rescue boot (QEMU only):
+// on/off, and how many to keep per VM (older automatic ones are deleted).
+
+const AutoSnapshotSchema = z.object({
+  enabled: z.boolean(),
+  keep: z.number().int().min(1).max(AUTO_SNAPSHOT_MAX_KEEP),
+});
+
+router.put('/settings/auto-snapshot', async (req: Request, res: Response) => {
+  const parsed = AutoSnapshotSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: 'Validation failed', details: parsed.error.flatten() });
+    return;
+  }
+  await saveAutoSnapshotSettings(parsed.data);
+  await recordAudit({
+    action: 'admin.auto_snapshot_config',
+    actor: (req as AuthRequest).user,
+    detail: parsed.data.enabled ? `automatic snapshots on, keep ${parsed.data.keep}` : 'automatic snapshots off',
+    req,
+  });
+  res.json({ success: true });
+});
+
+// ─── ENCRYPTION_KEY backup confirmation ───────────────────────
+// Admins are warned until one confirms the key is backed up off this host. Only
+// the confirmation (who/when) is ever returned — never the key.
+
+router.get('/encryption-key-backup', async (_req: Request, res: Response) => {
+  res.json(await getKeyBackupStatus());
+});
+
+router.post('/encryption-key-backup/confirm', requireSession, async (req: Request, res: Response) => {
+  const user = (req as AuthRequest).user;
+  try {
+    res.json(await confirmKeyBackup({ id: user.id, email: user.email }, req));
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : 'Could not record the confirmation' });
+  }
 });
 
 // ─── GET /api/admin/cluster-stats ─────────────────────────────
@@ -1168,6 +1263,7 @@ const ImportGuestSchema = z.object({
   ownerId: z.string().min(1).max(64),
   quotaExempt: z.boolean().optional(),
   adminManaged: z.boolean().optional(),
+  movePool: z.boolean().optional(),
 });
 
 router.post('/guests/import', async (req: Request, res: Response) => {
@@ -1176,10 +1272,13 @@ router.post('/guests/import', async (req: Request, res: Response) => {
   const owner = await prisma.user.findUnique({ where: { id: parsed.data.ownerId } });
   if (!owner) { res.status(404).json({ error: 'No such user to import for.' }); return; }
   try {
-    const vm = await importGuest((req as AuthRequest).user, { ...parsed.data, owner });
-    res.status(201).json({ vm });
+    const { vm, poolNote } = await importGuest((req as AuthRequest).user, { ...parsed.data, owner });
+    res.status(201).json({ vm, poolNote });
   } catch (err) {
-    if (err instanceof ImportError) { res.status(err.status).json({ error: err.message }); return; }
+    if (err instanceof ImportError) {
+      res.status(err.status).json({ error: err.message, ...(err.code ? { code: err.code } : {}) });
+      return;
+    }
     if (err instanceof QuotaError) {
       res.status(403).json({
         error: `Importing this guest would exceed ${owner.email}'s quota (${Object.keys(err.details).join(', ')}). ` +

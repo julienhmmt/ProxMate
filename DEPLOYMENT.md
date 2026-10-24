@@ -109,12 +109,84 @@ It picks the guest-agent privileges for your release (`VM.Monitor` on Proxmox VE
 `VM.GuestAgent.Audit` + `VM.GuestAgent.Unrestricted` + `VM.GuestAgent.FileWrite` on 9). Re-running it updates the
 role and ACLs and never re-issues an existing token. The connection test names any
 privilege that is still missing; a correctly created token passes it with no warnings
-(`VM.Audit` and `Datastore.Audit` are the two that block outright). The grant has to be
-on `/`: the cluster firewall, cluster status and cloud-image downloads are checked there.
+(`VM.Audit` and `Datastore.Audit` are the two that block outright). By default the grant
+is on `/`: the cluster firewall, cluster status and cloud-image downloads are checked there
+(the pool-scoped mode below keeps only `Sys.Audit` and `Sys.Modify` on `/`).
 The role has been run end to end on a Proxmox VE 9.2 cluster: every ProxMate feature
 worked through it. On 9.2, `VM.GuestAgent.Unrestricted` already covers guest file writes
 (the IDE bootstrap and pushing a file into a VM), so `VM.GuestAgent.FileWrite` is only belt
 and braces there. The old `--with-ide` option is still accepted and changes nothing.
+
+**Pool-scoped token (optional).** With the grant on `/`, the boundary between guests is
+ProxMate's ownership-tag check, not a Proxmox permission. `--pool <name>` instead grants the
+guest privileges on a Proxmox resource pool, so Proxmox itself refuses the token guests outside it:
+
+```bash
+bash proxmox-token.sh --dry-run --pool proxmate   # prints the ACL plan and the commands
+bash proxmox-token.sh --pool proxmate             # creates the pool if missing
+#   --snippet-storage <id>   optional: Datastore.Allocate there, so ProxMate can enable snippets
+#   --import-storage <id>    optional: Datastore.Allocate there, so ProxMate can delete imported images
+#   --with-cluster-firewall  let ProxMate enable the cluster firewall (see below)
+#   --drop-root-grant        remove the earlier grant on / (refused while the pool is empty; --force)
+```
+
+| Path | Role | Privileges |
+| --- | --- | --- |
+| `/pool/<name>` | `ProxMate-Guest` | every `VM.*` privilege above, `Pool.Audit`, `Pool.Allocate` |
+| `/nodes` | `ProxMate-Infra` | `Sys.Audit`, `Sys.AccessNetwork` (8.2+, cloud-image downloads) |
+| `/storage` | `ProxMate-Infra` | `Datastore.Audit`, `.AllocateSpace`, `.AllocateTemplate` |
+| `/storage/<id>`, only for `--snippet-storage` / `--import-storage` | `ProxMate-Storage` | the same plus `Datastore.Allocate` |
+| `/sdn/zones` | `ProxMate-Infra` | `SDN.Audit`, `SDN.Use` |
+| `/mapping` (with `--with-passthrough`) | `ProxMate-Infra` | `Mapping.Audit`, `Mapping.Use` |
+| `/`, not propagated | `ProxMate-Cluster` | `Sys.Audit`; `Sys.Modify` only with `--with-cluster-firewall` |
+
+By default no storage gets `Datastore.Allocate`, which deletes any volume on it. ProxMate writes
+cloud-init snippets through its mount and needs it only to switch a storage's snippets content
+type on (do that once as root instead), and to delete a downloaded cloud image after building a
+template (without it the image stays under the import storage's `import/` folder for you to
+remove). The script warns when a storage you name also holds disk images, container volumes or
+backups. Re-running it removes `ProxMate-*` grants an earlier run left on other paths (an old pool
+or storage); `--dry-run` shows them.
+
+Uploaded backups need a shared backup storage in this mode (or a single node): ProxMate checks the
+upload on the share and reads its guest config from the file itself, because Proxmox would only
+answer those questions about an archive whose guest does not exist yet with `Datastore.Allocate`
+on the whole backup storage. `.vma` and container `.tar` backups, plain or `.zst`/`.gz`, are read;
+`.lzo` and old-format QEMU `.tar` ones are refused. In both modes the restored guest's config is
+read back from Proxmox before it is used. A guest carrying settings ProxMate won't restore first
+loses its protection and autostart and is then deleted; if Proxmox refuses the delete, the refused
+settings are removed where the API allows it, every NIC is set to link down, and the machine is
+held for an admin.
+
+`Sys.Modify` on `/` also opens cluster backup jobs, the cluster firewall's groups and IP sets and
+other cluster settings, so it is opt-in: while the token holds it the pool does not fully contain
+it. Without it, turn on tenant isolation's cluster firewall once by hand as root (Datacenter →
+Firewall: add an accept rule for your management network on ports 8006 and 22, then enable it);
+the connection test warns until it is on. Before Proxmox VE 8.2 there is no `Sys.AccessNetwork`,
+so the script grants `Sys.Modify` on `/` for cloud-image downloads and says so.
+
+Then set **Proxmox pool** to the same name (setup wizard, or Admin → Settings → Proxmox
+connection): every guest ProxMate creates, clones, restores, imports or adopts through "Import
+existing guests" is placed in it. Setting it does not move existing guests. When switching an
+existing install over:
+
+1. Run the script with `--pool <name>`. It keeps the token's earlier `ProxMate` grant on `/`.
+2. Set the pool in ProxMate and run the connection test. It warns that the token still holds guest
+   privileges on `/`, and lists the guests ProxMate manages that are outside the pool.
+3. Click **Move managed guests into the pool**. Only guests carrying a ProxMate ownership tag
+   (machines and Template Store templates) are moved, one at a time; a template in another pool is
+   moved only after you confirm. Re-test until nothing is listed.
+4. Run `bash proxmox-token.sh --pool <name> --drop-root-grant` and test again: the `/` warning is
+   gone. A guest left outside the pool is now invisible to ProxMate (its row reads as unconfirmed);
+   as root, `pveum pool modify <name> --vms <vmid> --allow-move 1` puts it in.
+
+With a pool-scoped token ProxMate only sees guests in the pool: the Cluster Balancer, alerts and
+"Import existing guests" work on those alone. Templates you register by hand must be in the pool,
+since cloning checks `VM.Clone` on the template. Backups of a guest that is gone (deleted, or
+destroyed by a rebuild that then failed) are not reachable through the pool: the token cannot list
+them, read their config or delete them. Restore one as root, or rebuild the machine first (its VMID
+back in the pool makes its backups reachable again). This mode has
+not yet been run end to end on a live cluster.
 
 ---
 
@@ -168,6 +240,7 @@ Fill in the **PRODUCTION** block (replace the domain). The key values:
 | `GUEST_FILE_PUSH_MAX_BYTES` | *(optional)* default `1048576` | Largest file a push accepts; capped at 8 MiB (`8388608`). |
 | `PUBLIC_TOKEN_RATE_LIMIT_MAX` / `_WINDOW_MS` | *(optional)* default `60` / `900000` | Public token lookups (invite links, downloads), per IP. |
 | `ALERT_COOLDOWN_MIN` | *(optional)* default `60`, minimum `5` | Minutes before a firing alert rule can fire again. |
+| `RECONCILE_STUCK_MINUTES` | *(optional)* default `15`, minimum `1` | Minutes a machine left creating, restoring or rebuilding (or a backup left running) by a restart must sit untouched before ProxMate settles it. Operations still running are never touched. |
 | `PROXMOX_CA_CERT_FILE` | *(optional)* e.g. `/certs/pve-ca.pem` | Keep Proxmox TLS verification on against a private CA. A container path: mount the PEM in `docker-compose.override.yml`. |
 | `IDE_GUEST_PORT` | *(optional)* default `8080` | Port `code-server` listens on inside tenant VMs for the ProxMate IDE (§16). The proxy, the guest install and the firewall pinhole all use it. |
 | `SELF_UPDATE_ENABLED` / `UPDATE_REPO` | *(optional)* | The one-click update button (§14.3) and the GitHub repo the release check reads. `GITHUB_TOKEN` raises the GitHub API rate limit for that check. |
@@ -467,6 +540,8 @@ of snapshot is reversible.
 > password manager or secret store closes the risk permanently. Snapshots stored on a
 > second disk in the same machine do **not** protect you: lose the chassis and every
 > secret inside those backups is undecryptable. Do this now rather than at restore time.
+> Admins see a banner on every page until one of them confirms the key is backed up;
+> the confirmation (who and when) is audited, and a changed key brings the banner back.
 
 ---
 

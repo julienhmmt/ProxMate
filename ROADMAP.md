@@ -24,12 +24,6 @@ This file leads with **what's still open**, then **new ideas**, then a condensed
 
 ### Placement & reliability
 
-- **Background reconciler for Proxmox tasks.** A create that *fails* is already handled (the machine
-  is held and its page says why). The gap is a backend *restart* in the middle of a create, restore
-  or rebuild: the rest of that work is lost, and the status sync deliberately skips rows still in
-  `creating`, so the machine stays `creating` forever. A startup and periodic sweep that inspects
-  Proxmox and settles each stuck row closes it; the passthrough startup recovery
-  (`reconcileInterruptedPassthroughApplies`) is the pattern to follow.
 - **First-class Postgres support.** The Prisma schema is portable but the shipped migration history
   is SQLite-locked (`migration_lock.toml`), and the built-in app-DB backup uses SQLite's
   `VACUUM INTO`. Postgres today means `db push` + `pg_dump`; proper support wants a migration
@@ -37,17 +31,10 @@ This file leads with **what's still open**, then **new ideas**, then a condensed
 
 ### Production hardening & ops
 
-- **`ENCRYPTION_KEY` loss-safety.** Losing the key means losing the Proxmox token, SMTP creds,
-  tenant AI keys, and TOTP secrets in one stroke. The docs runbook pairs key backup with DB backups
-  explicitly, and the app-database backup card already carries a static reminder. Still open: an
-  admin warning that stays visible until an admin confirms the key is backed up.
-- **Pool-scoped Proxmox token (optional).** The `ProxMate` role is granted on `/`, because placement,
-  migration and the balancer work across every node, so the per-guest boundary today is ProxMate's
-  ownership-tag check rather than a Proxmox permission. Offer a mode where the role is granted on a
-  Proxmox resource pool instead: ProxMate puts every guest it creates, clones or restores into that
-  pool, and Proxmox itself denies the token any guest outside it. Needs the node, storage and SDN
-  paths the role still requires outside the pool worked out, a connection-test check that the pool
-  exists, and `deploy/proxmox-token.sh` support.
+- **Pool mode: recovering a machine whose guest is gone.** With a pool-scoped token, a guest's
+  backups leave the pool when the guest is destroyed, so a rebuild that fails after destroying the
+  old guest leaves backups the token cannot list or restore (root can). Keep the old guest until the
+  new one exists, or give rebuild a restore path that works before the VMID is back in the pool.
 - **Production validation passes.** The shipped OIDC SSO flow and the full 2FA/passkey matrix
   (TOTP, recovery codes, passkeys, invite-enforced 2FA) each need a documented end-to-end QA pass
   on a live deployment.
@@ -88,12 +75,9 @@ This file leads with **what's still open**, then **new ideas**, then a condensed
 
 Fresh proposals; none built yet. Each stays inside the API-only + tenant-isolation model.
 
-1. **Auto-snapshot before risky ops.** Optionally take a snapshot right before a rebuild/resize/rescue
-   (QEMU) so a bad change is one rollback away. Snapshots already exist; this just wires a safety net
-   into the destructive paths, with a retention cap. _CE._
-2. **Two-person approval for destructive admin actions.** Optional policy: a second admin must confirm
+1. **Two-person approval for destructive admin actions.** Optional policy: a second admin must confirm
    a bulk-delete / node-drain / firewall-disable before it runs. Rides the existing audit log. _EDU._
-3. **Status page / scheduled reports.** A lightweight public/authed status page (node health, capacity,
+2. **Status page / scheduled reports.** A lightweight public/authed status page (node health, capacity,
    incidents) and optional scheduled admin reports (capacity trend, top consumers) off the existing
    `ResourceSample` + cluster-health data. _EDU._
 
@@ -105,6 +89,18 @@ Full detail + dates in [`completed-tasks.md`](completed-tasks.md).
 
 ### Unreleased
 
+- **Pool-scoped Proxmox token (optional) — needs live verification.** A `proxmox_pool` setting
+  (setup wizard and Admin → Settings) places every guest ProxMate creates, clones, restores or
+  imports in that resource pool. `deploy/proxmox-token.sh --pool <name>` creates the pool and
+  grants the guest privileges on `/pool/<name>` only, with `Sys.Audit`/`Sys.AccessNetwork` on
+  `/nodes`, `Datastore.*` without `Datastore.Allocate` on `/storage` (that one only on a storage
+  named for it), `SDN.*` on `/sdn/zones`, and `Sys.Audit` on `/` alone (`Sys.Modify` opt-in with
+  `--with-cluster-firewall`). Uploaded backups are renamed to their reserved VMID and read on the
+  share, so Proxmox never has to expose the backup storage. The connection test checks the pool exists, the guest privileges on it,
+  guest privileges still on `/`, what still reaches past the pool, and managed guests outside the
+  pool (with a one-click, per-guest move for guests carrying a ProxMate ownership tag). Still to
+  do: run it end to end on a PVE 9 cluster and confirm Proxmox refuses the token on a guest outside
+  the pool while every feature works inside it.
 - **Number fields can be cleared and retyped.** Emptying a numeric field no longer leaves a stuck
   `0` that turns the next digit into "02"; min/max apply when the field loses focus.
 - **Projects (tag rollups).** A **Projects** page groups a tenant's VMs by a `project:<name>` tag:
@@ -142,6 +138,23 @@ Full detail + dates in [`completed-tasks.md`](completed-tasks.md).
   or — admin — one copy into each chosen user's account. The whole batch is checked against quota
   before anything is cloned; copies deploy a few at a time, each placed and isolated like a single
   deploy, with per-copy results. _CE primitive._
+
+- **Interrupted operations are settled.** At startup and every 5 minutes, rows a backend restart left
+  `creating` (a create, clone, upload restore or rebuild) or with a MateState `creating`/`restoring`
+  are resolved from Proxmox: never one whose operation is still running in this process, is younger
+  than `RECONCILE_STUCK_MINUTES` (15), or whose Proxmox task or guest lock is still active. A finished
+  ISO/LXC create or ISO rebuild is completed (left stopped); anything part-way is held with the
+  existing provisioning/restore hold and admins are notified; a create that produced no guest is
+  dropped as a failed create is; interrupted backups are recorded or marked failed. Nothing deletes a
+  guest or a backup.
+- **Automatic snapshots before risky changes (VMs).** Before a resize, a data-disk grow or a rescue
+  boot, a `pm-auto-<op>-<timestamp>` snapshot is taken; a failed snapshot refuses the change. The
+  newest N (default 3) per VM are kept, and retention only deletes snapshots ProxMate recorded
+  itself. On by default; Admin → Settings → Maintenance. A rebuild is not covered: deleting the guest
+  deletes its snapshots, so the rebuild dialog says to take a backup.
+- **`ENCRYPTION_KEY` backup confirmation.** Admins see a warning on every page until one confirms
+  the key is backed up off the host; who and when is stored and audited, and a changed key brings the
+  warning back. The key is never shown.
 
 ### Released
 

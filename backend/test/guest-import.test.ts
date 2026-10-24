@@ -1,10 +1,15 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 // Admin import of a Proxmox guest ProxMate didn't create: only a guest nothing else
 // could claim is accepted, and an accepted one gets this row's tag (its other tags
 // kept), the isolation firewall a new guest gets, and a row counted toward quota.
 
 const rows: Array<Record<string, unknown>> = [];
+/** A row matching a where clause of plain values (Dates compared by time). */
+const sameRow = (r: Record<string, unknown>, where: Record<string, unknown>) =>
+  Object.entries(where).every(([k, v]) =>
+    v instanceof Date ? r[k] instanceof Date && (r[k] as Date).getTime() === v.getTime() : r[k] === v,
+  );
 const templates: Array<{ proxmoxVmId: number }> = [];
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -34,7 +39,23 @@ vi.mock('../src/lib/prisma.js', () => ({
       delete: vi.fn(async ({ where }: { where: { id: string } }) => {
         rows.splice(rows.findIndex((r) => r['id'] === where.id), 1);
       }),
+      // The restart reconciler's conditional writes (by id + status + opStartedAt).
+      updateMany: vi.fn(async ({ where, data }: { where: Record<string, unknown>; data: Record<string, unknown> }) => {
+        const hit = rows.filter((r) => sameRow(r, where));
+        for (const r of hit) Object.assign(r, data);
+        return { count: hit.length };
+      }),
+      deleteMany: vi.fn(async ({ where }: { where: Record<string, unknown> }) => {
+        const i = rows.findIndex((r) => sameRow(r, where));
+        if (i < 0) return { count: 0 };
+        rows.splice(i, 1);
+        return { count: 1 };
+      }),
+      findUnique: vi.fn(async ({ where }: { where: { id: string } }) => rows.find((r) => r['id'] === where.id) ?? null),
     },
+    ideGuestSecret: { deleteMany: vi.fn(async () => ({})) },
+    ideGatewayToken: { deleteMany: vi.fn(async () => ({})) },
+    $transaction: vi.fn(async (ops: Array<Promise<unknown>>) => Promise.all(ops)),
     template: {
       count: vi.fn(async ({ where }: { where: { proxmoxVmId: number } }) =>
         templates.filter((t) => t.proxmoxVmId === where.proxmoxVmId).length,
@@ -59,6 +80,9 @@ import { importGuest, listImportableGuests, ImportError } from '../src/services/
 import { hostLevelKeys } from '../src/lib/guest-config.js';
 import { QuotaError, guestMarker } from '../src/services/vm.service.js';
 import { recordAudit } from '../src/services/audit.service.js';
+import { prisma } from '../src/lib/prisma.js';
+import { isInFlight } from '../src/lib/in-flight.js';
+import { reconcileCreatingVm, STUCK_AFTER_MS } from '../src/services/task-reconcile.service.js';
 import { fakeClient, asClient, bodyOf } from './helpers.js';
 
 const ok = (data: unknown) => Promise.resolve({ data: { data } });
@@ -117,14 +141,77 @@ describe('listing importable guests', () => {
     ]);
     const list = await listImportableGuests();
     expect(list.map((g) => g.vmid)).toEqual([200, 204]);
-    expect(list[1]).toEqual({ vmid: 204, node: 'pve2', name: 'ct', type: 'lxc', status: 'stopped', cpu: 1, ramMb: 512, diskGb: 8 });
+    expect(list[1]).toEqual({ vmid: 204, node: 'pve2', name: 'ct', type: 'lxc', status: 'stopped', cpu: 1, ramMb: 512, diskGb: 8, pool: null });
   });
 });
 
 describe('importing a guest', () => {
+  describe('with a Proxmox pool configured', () => {
+    let base: ((key: string) => Promise<string | null>) | undefined;
+    beforeEach(async () => {
+      const { getConfig } = await import('../src/services/config.service.js');
+      base = vi.mocked(getConfig).getMockImplementation() as never;
+      vi.mocked(getConfig).mockImplementation(async (key: string) => (key === 'proxmox_pool' ? 'proxmate' : base!(key)));
+    });
+    afterEach(async () => {
+      const { getConfig } = await import('../src/services/config.service.js');
+      vi.mocked(getConfig).mockImplementation(base as never);
+    });
+
+    it('adds the imported guest to the pool and says so in the audit entry', async () => {
+      const c = cluster(BASE_CFG);
+      await importGuest(ADMIN, { vmid: 200, owner: owner() });
+      const put = c.put.mock.calls.find((x) => x[0] === '/pools');
+      expect(bodyOf(put!)).toEqual({ poolid: 'proxmate', vms: '200', 'allow-move': '1' });
+      expect(recordAudit).toHaveBeenCalledWith(
+        expect.objectContaining({ action: 'vm.import', detail: expect.stringMatching(/added to pool proxmate$/) }),
+      );
+    });
+
+    it('still imports when the pool refuses the guest, and records why', async () => {
+      const c = cluster(BASE_CFG);
+      c.put.mockImplementation((url: string) =>
+        url === '/pools' ? Promise.reject(new Error('Permission check failed')) : ok(''),
+      );
+      const { vm } = await importGuest(ADMIN, { vmid: 200, owner: owner() });
+      expect(vm).toMatchObject({ proxmoxVmId: 200 });
+      expect(recordAudit).toHaveBeenCalledWith(
+        expect.objectContaining({ detail: expect.stringMatching(/not added to pool proxmate: Permission check failed/) }),
+      );
+    });
+
+    it('refuses a guest in another pool unless the admin confirms the move', async () => {
+      const c = cluster(BASE_CFG);
+      const baseGet = c.get.getMockImplementation()!;
+      c.get.mockImplementation((url: string) =>
+        url.startsWith('/cluster/resources')
+          ? ok([{ type: 'qemu', vmid: 200, node: 'pve1', name: 'legacy-web', tags: 'prod;web', pool: 'lab', status: 'running' }])
+          : baseGet(url),
+      );
+      await expect(importGuest(ADMIN, { vmid: 200, owner: owner() })).rejects.toMatchObject({ code: 'pool_move', status: 409 });
+      expect(c.put).not.toHaveBeenCalled();
+
+      const r = await importGuest(ADMIN, { vmid: 200, owner: owner(), movePool: true });
+      expect(r.poolNote).toBe('Added to the Proxmox pool proxmate (moved out of lab).');
+      expect(bodyOf(c.put.mock.calls.find((x) => x[0] === '/pools')!)).toEqual({ poolid: 'proxmate', vms: '200', 'allow-move': '1' });
+    });
+
+    it('leaves a guest that is already in the pool alone', async () => {
+      const c = cluster(BASE_CFG);
+      const baseGet = c.get.getMockImplementation()!;
+      c.get.mockImplementation((url: string) =>
+        url.startsWith('/cluster/resources')
+          ? ok([{ type: 'qemu', vmid: 200, node: 'pve1', name: 'legacy-web', tags: 'prod;web', pool: 'proxmate', status: 'running' }])
+          : baseGet(url),
+      );
+      await importGuest(ADMIN, { vmid: 200, owner: owner() });
+      expect(c.put.mock.calls.some((x) => x[0] === '/pools')).toBe(false);
+    });
+  });
+
   it('writes the marker (keeping its tags), applies isolation, records the row and audits it', async () => {
     const c = cluster(BASE_CFG);
-    const vm = await importGuest(ADMIN, { vmid: 200, owner: owner() });
+    const { vm } = await importGuest(ADMIN, { vmid: 200, owner: owner() });
 
     expect(vm).toMatchObject({
       userId: 'u1', proxmoxVmId: 200, proxmoxNode: 'pve1', type: 'qemu', name: 'legacy-web',
@@ -183,7 +270,7 @@ describe('importing a guest', () => {
     await expect(importGuest(ADMIN, { vmid: 200, owner: owner() })).rejects.toBeInstanceOf(QuotaError);
     expect(rows).toHaveLength(1);
 
-    const vm = await importGuest(ADMIN, { vmid: 200, owner: owner(), quotaExempt: true, adminManaged: false });
+    const { vm } = await importGuest(ADMIN, { vmid: 200, owner: owner(), quotaExempt: true, adminManaged: false });
     // An exempt grant is always admin-managed.
     expect(vm).toMatchObject({ quotaExempt: true, adminManaged: true });
   });
@@ -260,7 +347,7 @@ describe('importing a guest', () => {
       if (/\/snapshot\/clean\/config$/.test(url)) return ok({ ...BASE_CFG, vmstate: 'local-lvm:vm-200-state-clean' });
       return base(url);
     });
-    await expect(importGuest(ADMIN, { vmid: 200, owner: owner() })).resolves.toMatchObject({ proxmoxVmId: 200 });
+    await expect(importGuest(ADMIN, { vmid: 200, owner: owner() })).resolves.toMatchObject({ vm: { proxmoxVmId: 200 } });
   });
 
   it('treats virtiofs and ivshmem as host-level', () => {
@@ -269,5 +356,51 @@ describe('importing a guest', () => {
       'ivshmem',
       'parallel0',
     ]);
+  });
+});
+
+describe('imports and the restart reconciler', () => {
+  it('keeps the import in flight while it runs, records it as an import, and clears that once settled', async () => {
+    const c = cluster(BASE_CFG);
+    const seen: boolean[] = [];
+    const put = c.put.getMockImplementation()!;
+    c.put.mockImplementation((url: string, body: URLSearchParams) => {
+      const id = rows[0]?.['id'] as string | undefined;
+      if (id) seen.push(isInFlight(id));
+      return put(url, body);
+    });
+    const { vm } = await importGuest(ADMIN, { vmid: 200, owner: owner() });
+    expect(seen.length).toBeGreaterThan(0);
+    expect(seen.every(Boolean)).toBe(true);
+    expect(isInFlight(vm.id)).toBe(false);
+    expect(vm).toMatchObject({ opKind: null, opStartedAt: null, opUpid: null });
+    expect(vi.mocked(prisma.virtualMachine.create).mock.calls[0]![0].data).toMatchObject({ opKind: 'import' });
+  });
+
+  const stuck = () => {
+    const old = new Date(Date.now() - STUCK_AFTER_MS - 60_000);
+    const row = {
+      id: 'imp1', userId: 'u1', name: 'legacy-web', type: 'qemu', proxmoxVmId: 200, proxmoxNode: 'pve1',
+      status: 'creating', holdReason: null, opKind: 'import', opStartedAt: old, opUpid: null, updatedAt: old,
+    };
+    rows.push(row);
+    return row as never;
+  };
+
+  it('completes an interrupted import whose tag (written after isolation, as the last step) is on the guest', async () => {
+    const c = cluster({ ...BASE_CFG, tags: `prod;web;${guestMarker('imp1')}` });
+    expect(await reconcileCreatingVm(stuck(), asClient(c), new Date())).toBe('completed');
+    expect(rows[0]).toMatchObject({ status: 'running', holdReason: null, opKind: null });
+    expect(c.put).not.toHaveBeenCalled();
+    expect(c.post).not.toHaveBeenCalled();
+    expect(c.delete).not.toHaveBeenCalled();
+  });
+
+  it('drops the row of an interrupted import whose guest was never tagged, leaving the guest importable', async () => {
+    const c = cluster(BASE_CFG);
+    expect(await reconcileCreatingVm(stuck(), asClient(c), new Date())).toBe('dropped');
+    expect(rows).toHaveLength(0);
+    expect(c.put).not.toHaveBeenCalled();
+    expect(c.delete).not.toHaveBeenCalled();
   });
 });

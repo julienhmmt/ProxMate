@@ -480,8 +480,38 @@ export interface UpdateStatus {
   updatedAt?: string;
 }
 
+/** A guest carrying a ProxMate ownership marker, as the connection test reports it. */
+export interface PoolGuest {
+  vmid: number;
+  node: string;
+  name: string;
+  kind: "qemu" | "lxc";
+  template: boolean;
+  /** The pool it is in now, or null for none. */
+  pool: string | null;
+}
+
+/** The connection test's pool section (present only when a Proxmox pool is configured). */
+export interface PoolReport {
+  name: string;
+  exists: boolean | null;
+  missingOnPool: string[];
+  guestPrivilegesOnRoot: string[];
+  outside: PoolGuest[];
+  notVisible: Array<{ vmid: number; name: string }>;
+}
+
+export interface ProxmoxConnectionResult {
+  version: string;
+  nodeCount: number;
+  vmCount: number;
+  storageCount: number;
+  warnings?: string[];
+  pool?: PoolReport;
+}
+
 export interface AdminSettings {
-  proxmox: { host: string | null; tokenId: string | null; verifySsl: boolean; hasSecret: boolean };
+  proxmox: { host: string | null; tokenId: string | null; verifySsl: boolean; pool: string; hasSecret: boolean };
   defaults: { storage: string | null; bridge: string | null; isoStorage: string | null; backupStorage: string | null };
   smtp:
     | { configured: false }
@@ -514,6 +544,17 @@ export interface AdminSettings {
   };
   /** Kiosk-mode exit lock — whether a PIN is set (the value is never returned). */
   kiosk: { pinSet: boolean };
+  /** Automatic snapshots before a resize, data-disk grow or rescue boot (VMs only). */
+  autoSnapshot?: { enabled: boolean; keep: number };
+}
+
+/** Whether an admin has confirmed ENCRYPTION_KEY is backed up (the key itself is never sent). */
+export interface KeyBackupStatus {
+  confirmed: boolean;
+  confirmedAt: string | null;
+  confirmedBy: string | null;
+  /** A confirmation exists, but for a different key than the server runs with now. */
+  keyChanged: boolean;
 }
 
 /** Admin policy for ProxMate IDE (in-guest code-server + OpenCode). */
