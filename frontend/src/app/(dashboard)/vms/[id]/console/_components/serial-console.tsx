@@ -6,6 +6,7 @@ import { api, apiError } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { ConsoleTopBar, type ConsoleMode } from "./console-top-bar";
+import { ViewOnlyBadge } from "./view-only-badge";
 import "@xterm/xterm/css/xterm.css";
 
 type ConnState = "connecting" | "connected" | "disconnected" | "error" | "unsupported";
@@ -78,6 +79,8 @@ type TerminalLike = {
  * a dumb byte relay): authenticate with `${user}:${ticket}\n`; send keystrokes as
  * `0:<utf8-byte-length>:<data>`, terminal resizes as `1:<cols>:<rows>:`, and a
  * `2` keepalive. Incoming frames are raw terminal output written straight to xterm.
+ * A view-only session (the server says so with the ticket) opens xterm with stdin
+ * disabled and sends no keystrokes or resizes; the backend relay drops any that arrive anyway.
  */
 export function SerialConsole({
   id,
@@ -103,6 +106,7 @@ export function SerialConsole({
   const [state, setState] = useState<ConnState>("connecting");
   const [error, setError] = useState<string | null>(null);
   const [pipActive, setPipActive] = useState(false);
+  const [viewOnly, setViewOnly] = useState(false);
   const pipSupported = typeof window !== "undefined" && getDocumentPip() !== null;
 
   /** Float the terminal in an always-on-top PiP window (Chrome/Edge). */
@@ -181,10 +185,12 @@ export function SerialConsole({
     setError(null);
     teardown();
 
-    let ticket: string, port: string, user: string;
+    let ticket: string, port: string, user: string, watchOnly: boolean;
     try {
-      const res = await api.post<{ ticket: string; port: string; user: string }>(`/vms/${id}/serial`);
+      const res = await api.post<{ ticket: string; port: string; user: string; viewOnly?: boolean }>(`/vms/${id}/serial`);
       ({ ticket, port, user } = res.data);
+      watchOnly = res.data.viewOnly === true;
+      setViewOnly(watchOnly);
     } catch (err) {
       // 409 from the backend means the VM has no serial port (e.g. an ISO VM).
       const e = err as { response?: { status?: number; data?: { code?: string } } };
@@ -213,6 +219,8 @@ export function SerialConsole({
       cursorBlink: true,
       scrollback: 5000,
       theme: { background: "#000000", foreground: "#e5e7eb" },
+      disableStdin: watchOnly,
+      cursorStyle: watchOnly ? "underline" : "block",
     }) as unknown as TerminalLike;
 
     const fit = new FitAddon();
@@ -229,10 +237,11 @@ export function SerialConsole({
     fitRef.current = fit;
     termRef.current = term;
 
-    // Resize the remote PTY whenever xterm's geometry changes.
-    term.onResize(({ cols, rows }) => sendFrame(`1:${cols}:${rows}:`));
-    // Forward keystrokes.
-    term.onData((data) => sendFrame(`0:${enc.encode(data).length}:${data}`));
+    // Resize the remote PTY whenever xterm's geometry changes (not on a view-only
+    // session: the relay drops a viewer's resizes).
+    if (!watchOnly) term.onResize(({ cols, rows }) => sendFrame(`1:${cols}:${rows}:`));
+    // Forward keystrokes (never on a view-only session).
+    if (!watchOnly) term.onData((data) => sendFrame(`0:${enc.encode(data).length}:${data}`));
 
     const wsUrl = `${wsBase()}/vms/${id}/serial?${new URLSearchParams({ vncticket: ticket, port })}`;
     const ws = new WebSocket(wsUrl);
@@ -242,7 +251,7 @@ export function SerialConsole({
     ws.onopen = () => {
       // In-band auth, then sync the PTY size to the current terminal geometry.
       ws.send(`${user}:${ticket}\n`);
-      ws.send(`1:${term.cols}:${term.rows}:`);
+      if (!watchOnly) ws.send(`1:${term.cols}:${term.rows}:`);
       setState("connected");
       term.focus();
       pingRef.current = setInterval(() => sendFrame("2"), 30_000);
@@ -311,8 +320,9 @@ export function SerialConsole({
         <div className="mb-2 flex flex-wrap items-center justify-between gap-2 px-1">
           {statusIndicator}
           <div className="flex items-center gap-2">
+            {viewOnly && <ViewOnlyBadge />}
             <span className="hidden items-center gap-1.5 text-xs text-muted-foreground sm:flex">
-              <SquareTerminal className="size-3.5" /> Ctrl/⌘-click links · copy/paste works
+              <SquareTerminal className="size-3.5" /> {viewOnly ? "Ctrl/⌘-click links · copy works" : "Ctrl/⌘-click links · copy/paste works"}
             </span>
             {pipSupported && (
               <Button variant="outline" size="sm" onClick={enterPip} disabled={pipActive} title="Float the terminal in a window that stays on top (Chrome/Edge)">
@@ -330,6 +340,7 @@ export function SerialConsole({
             <SquareTerminal className="size-3.5" /> Ctrl/⌘-click links to open
           </span>
           {statusIndicator}
+          {viewOnly && <ViewOnlyBadge />}
           <Button
             variant="outline"
             size="sm"

@@ -27,6 +27,8 @@ const ACTIVITY_META: Record<string, { label: string; dot: string }> = {
   "vm.update": { label: "Notes updated", dot: "bg-muted-foreground" },
   "vm.resize": { label: "Resized", dot: "bg-sky-500" },
   "vm.rebuild": { label: "Rebuilt", dot: "bg-amber-500" },
+  "vm.console_open": { label: "Console opened", dot: "bg-muted-foreground" },
+  "vm.console_view_open": { label: "Console opened (view only)", dot: "bg-muted-foreground" },
   "vm.delete": { label: "Deleted", dot: "bg-red-500" },
   "snapshot.create": { label: "Snapshot taken", dot: "bg-sky-500" },
   "snapshot.rollback": { label: "Rolled back to snapshot", dot: "bg-amber-500" },

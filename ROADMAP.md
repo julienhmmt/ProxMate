@@ -61,17 +61,12 @@ This file leads with **what's still open**, then **new ideas**, then a condensed
 - **Surface admin-managed / quota-exempt to the owner** — partly built: the disks panel already says
   the VM was set up by an admin and its disks can't be changed here. Still open: a page-level badge
   and one-line explainer on the VM detail, since resize and rebuild are otherwise just hidden.
-- **Read-only console (input-blocked viewing)** — a Viewer share gets no console today; the noted
-  follow-up is a view-only, input-blocked console stream.
 
 ### IDE follow-ups
 
 - **Wire the gateway as a provider for code-server's built-in Chat view** (inert today; OpenCode
   runs as a terminal TUI instead). Needs a decision first: the IDE settings deliberately turn the
   built-in chat off so OpenCode is the focus.
-- **Surface the in-guest provision log** — an `ideState: failed` today means shelling into the guest
-  to read `/var/log/pmide-provision.log`; add a "view install log" action (owner/admin, via the guest
-  agent) on the failed state so installs are debuggable from the browser.
 
 ### Mobile
 
@@ -113,14 +108,11 @@ Fresh proposals; none built yet. Each stays inside the API-only + tenant-isolati
 3. **Auto-snapshot before risky ops.** Optionally take a snapshot right before a rebuild/resize/rescue
    (QEMU) so a bad change is one rollback away. Snapshots already exist; this just wires a safety net
    into the destructive paths, with a retention cap. _CE._
-4. **Guest-agent file push.** Reuse the exact trust model as password-reset / SSH-key-inject (QEMU
-   guest agent, argv-safe) to let an owner upload a small file into a VM (e.g. a config or starter
-   script) from the browser — no SSH. Size-capped, owner/Manager only. _CE._
-5. **More notification channels.** The webhook engine supports Discord/Slack/Mattermost/generic; add
+4. **More notification channels.** The webhook engine supports Discord/Slack/Mattermost/generic; add
    **ntfy** and **Telegram** presets, plus a weekly per-tenant **usage digest** email. _CE._
-6. **Two-person approval for destructive admin actions.** Optional policy: a second admin must confirm
+5. **Two-person approval for destructive admin actions.** Optional policy: a second admin must confirm
    a bulk-delete / node-drain / firewall-disable before it runs. Rides the existing audit log. _EDU._
-7. **Status page / scheduled reports.** A lightweight public/authed status page (node health, capacity,
+6. **Status page / scheduled reports.** A lightweight public/authed status page (node health, capacity,
    incidents) and optional scheduled admin reports (capacity trend, top consumers) off the existing
    `ResourceSample` + cluster-health data. _EDU._
 
@@ -139,6 +131,18 @@ Full detail + dates in [`completed-tasks.md`](completed-tasks.md).
   project, with start/stop/restart for the whole project through the existing bulk route. Set a
   project on the VM page or with **Move to project…** on the VM list (owner/admin only). VMs shared
   with you are listed apart, without their owner's tags; admins see every owner's projects.
+- **View-only console for Viewer shares.** A Viewer share can watch a VM's graphical and text
+  consoles. The relay enforces it: it parses the browser's RFB and termproxy streams and drops
+  every keyboard, mouse, clipboard, resize-desktop and power message before Proxmox sees it, and
+  forces a shared VNC session so a viewer never disconnects anyone else. Console opens are audited
+  (`vm.console_open`, or `vm.console_view_open` for a view-only session).
+- **View the IDE install log.** While the IDE installs, or after it failed, the VM's owner (or an
+  admin) opens **View install log**: the tail of `/var/log/pmide-provision.log` read through the
+  guest agent with a fixed command, cleaned of terminal control codes, with refresh and download.
+- **Push a file into a VM.** Owner, admin or Manager share (the `configure` capability, like SSH-key
+  add) uploads a small file (1 MiB default, up to 8 MiB via `GUEST_FILE_PUSH_MAX_BYTES`) to a strictly
+  validated path with a chosen mode and owner, through the guest agent; audited with path, size and
+  SHA-256, rate-limited per user. QEMU only.
 
 ### Released
 
